@@ -1,0 +1,51 @@
+services:
+  label-studio:
+    image: heartexlabs/label-studio:1.23.0
+    restart: always
+    container_name: label-studio
+    user: "1000"
+    environment:
+      - TZ=America/Argentina/Buenos_Aires
+      - DEBUG=True
+      - CSRF_TRUSTED_ORIGINS=https://labelstudio.brunoschillig.com
+    volumes:
+      - ./mydata:/label-studio/data:rw
+    ports:
+      - 10000:8080
+
+  yolo11-backend:
+    image: yolo11-label-studio-backend:latest
+    command: ["gunicorn", "--bind", "0.0.0.0:9090", "--timeout", "600", "--access-logfile", "-", "app:app"]
+    gpus: all
+    shm_size: 4gb
+    restart: always
+    container_name: yolo11-backend
+    environment:
+      - TZ=America/Argentina/Buenos_Aires
+      - MODEL_PATH=/models/precintos-s.pt
+      - TRAIN_MODEL_PATH=/models/precintos-s.pt
+      - LABEL_STUDIO_URL=http://label-studio:8080
+      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY:-}
+      - LABEL_STUDIO_AUTH_SCHEME=Bearer
+      - LABEL_STUDIO_JWT_USER_ID=1
+      - CONFIDENCE_THRESHOLD=0.25
+      - TRAIN_EPOCHS=50
+      - TRAIN_IMGSZ=640
+      - TRAIN_BATCH=8
+      - TRAIN_PATIENCE=20
+      - TRAIN_WORKERS=2
+      - TRAIN_DEVICE=auto
+    volumes:
+      - ./yolo11-backend/app.py:/app/app.py:ro
+      - ./mydata:/label-studio/data:rw
+      - ./mydata/yolo-backend:/app/data:rw
+      - /m2data/proyectos/neural-vision/infra/nv-client1/models:/models:rw
+    ports:
+      - 9090:9090
+    depends_on:
+      - label-studio
+    networks:
+      default:
+        aliases:
+          - yolo11-backend.local
+          
