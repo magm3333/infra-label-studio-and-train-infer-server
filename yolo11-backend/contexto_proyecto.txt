@@ -1,0 +1,255 @@
+DIRECTIVA OBLIGATORIA PARA FUTUROS AGENTES:
+Cualquier modificacion que se haga en este proyecto debe actualizar este mismo archivo, /m2data/infra-label-studio/infra/yolo11-backend/contexto_proyecto.txt, dejando asentados los cambios relevantes, decisiones tecnicas, comandos de despliegue/verificacion y cualquier consideracion necesaria para retomar el trabajo en el futuro sin reanalizar todo el proyecto.
+Despues de cualquier cambio que deba probarse, reconstruir la imagen Docker y recrear el contenedor yolo11-backend antes de indicar que esta listo para prueba. Comandos esperados: docker build -t yolo11-label-studio-backend:latest "yolo11-backend" y docker compose up -d --force-recreate yolo11-backend.
+
+CONTEXTO GENERAL
+Proyecto: yolo11-backend dentro de /m2data/infra-label-studio/infra.
+Objetivo: backend Flask/Gunicorn para integrar Label Studio con YOLO/Ultralytics. Sirve predicciones para pre-anotacion y permite lanzar entrenamientos desde anotaciones exportadas de Label Studio.
+Archivo principal: /m2data/infra-label-studio/infra/yolo11-backend/app.py.
+Dockerfile: /m2data/infra-label-studio/infra/yolo11-backend/Dockerfile.
+Compose: /m2data/infra-label-studio/infra/docker-compose.yml.
+README: /m2data/infra-label-studio/infra/yolo11-backend/README.md.
+
+SERVICIOS DOCKER
+El compose define dos servicios principales relacionados:
+label-studio:
+Imagen: heartexlabs/label-studio:1.23.0.
+Container: label-studio.
+Puerto host: 10000 -> contenedor 8080.
+Volumen: ./mydata:/label-studio/data:rw.
+
+yolo11-backend:
+Imagen: yolo11-label-studio-backend:latest.
+Container: yolo11-backend.
+Comando: gunicorn --bind 0.0.0.0:9090 --timeout 600 --access-logfile - app:app.
+Puerto host: 9090 -> contenedor 9090.
+GPU: gpus all.
+shm_size: 4gb.
+Alias de red: yolo11-backend.local.
+Depende de: label-studio.
+
+Volumenes relevantes de yolo11-backend:
+./yolo11-backend/app.py:/app/app.py:ro. Esto implica que cambios en app.py se reflejan con restart/recreate del servicio, aunque tambien se construya la imagen.
+./mydata:/label-studio/data:rw. Permite resolver archivos de Label Studio desde el backend.
+./mydata/yolo-backend:/app/data:rw. Aqui se guardan jobs, runs, datasets temporales y modelos entrenados.
+/m2data/proyectos/neural-vision/infra/nv-client1/models:/models:rw. Aqui vive el modelo base por defecto.
+
+VARIABLES DE ENTORNO IMPORTANTES
+MODEL_PATH=/models/precintos-s.pt. Modelo activo/base inicial para inferencia.
+TRAIN_MODEL_PATH=/models/precintos-s.pt. Modelo base para entrenamientos.
+LABEL_STUDIO_URL=http://label-studio:8080.
+LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY:-}. Token opcional; si esta vacio el backend intenta generar JWT local desde la configuracion de Label Studio.
+LABEL_STUDIO_AUTH_SCHEME=Bearer.
+LABEL_STUDIO_JWT_USER_ID=1.
+CONFIDENCE_THRESHOLD=0.25.
+TRAIN_EPOCHS=50.
+TRAIN_IMGSZ=640.
+TRAIN_BATCH=8.
+TRAIN_PATIENCE=20.
+TRAIN_WORKERS=2.
+TRAIN_DEVICE=auto.
+TRAIN_SPLIT_PERCENT=70. Agregado en app.py; default 70 si no se define en compose/env.
+TRAIN_LR0=0.01. Learning rate inicial de Ultralytics/YOLO.
+TRAIN_WEIGHT_DECAY=0.0005. Regularizacion L2/weight decay.
+TRAIN_COS_LR=false. Activa scheduler coseno si se define true/1/yes/on.
+
+DEPENDENCIAS PYTHON
+requirements.txt contiene:
+flask==3.0.3
+gunicorn==22.0.0
+ultralytics==8.3.38
+opencv-python-headless==4.10.0.84
+pillow==10.4.0
+requests==2.32.3
+PyYAML==6.0.2
+
+ENDPOINTS PRINCIPALES
+GET /health: healthcheck simple. Devuelve status UP, model_path y training.
+GET /status: estado global, GPU y configuracion default de entrenamiento.
+GET /: UI web para jobs, lanzamiento de entrenamiento, estado, metricas, curvas, modelos entrenados.
+POST /setup: Label Studio envia label_config; parsea nombres de labels y campos.
+POST /predict: genera predicciones YOLO para tareas de Label Studio.
+POST /train: lanza entrenamiento async para un proyecto Label Studio.
+GET /api/jobs: lista jobs.
+GET /api/jobs-fragment: fragmento HTML de cards de jobs para refresco en UI.
+GET /api/jobs/<job_id>: detalle de un job.
+DELETE /api/jobs/<job_id>: elimina job y artefactos asociados si no esta corriendo.
+POST /api/jobs/<job_id>/cancel: cancela job corriendo reiniciando el backend con _os._exit(0).
+GET /api/models: lista modelos entrenados y modelos disponibles.
+POST /api/active-model: cambia el modelo activo de inferencia.
+GET /download/models/<name>: descarga modelos .pt guardados.
+
+ESTRUCTURA DE DATOS EN /app/data
+Dentro del contenedor /app/data esta montado desde ./mydata/yolo-backend en el host.
+Directorios/archivos usados:
+/app/data/jobs.json: persistencia de jobs publicos.
+/app/data/training/: datasets temporales convertidos a YOLO por entrenamiento.
+/app/data/runs/: runs de Ultralytics con results.csv, pesos, graficos, etc.
+/app/data/models/: modelos best.pt copiados al terminar entrenamiento.
+Metadata de modelo: se guarda como archivo JSON junto al .pt, con path <modelo>.pt.json.
+
+CONFIGURACION LABEL STUDIO ESPERADA
+El proyecto Label Studio debe usar RectangleLabels sobre Image. Ejemplo minimo del README:
+<View>
+  <Image name="image" value="$image"/>
+  <RectangleLabels name="label" toName="image">
+    <Label value="precinto"/>
+  </RectangleLabels>
+</View>
+Los nombres de labels deben coincidir con las clases del modelo YOLO, o con las clases definidas en el label_config parseado.
+
+FLUJO DE INFERENCIA
+Label Studio llama /setup y /predict.
+parse_label_config extrae from_name, to_name, value y labels desde el XML de Label Studio.
+prediction_for_task resuelve la imagen, ejecuta YOLO sobre ella y transforma cajas a formato RectangleLabels en porcentajes para Label Studio.
+resolve_image_path puede resolver rutas locales bajo /label-studio/data, rutas relativas, o descargar temporalmente URLs si hace falta.
+
+FLUJO DE ENTRENAMIENTO
+POST /train recibe project/project_id/project_id_from_task o project desde task.
+request_train_config arma la config efectiva desde payload, headers X-Train-* o defaults.
+train_async corre en thread daemon.
+Pasos de train_async:
+1. Lee configuracion del proyecto desde Label Studio con /api/projects/<id>.
+2. Parsea label_config.
+3. Exporta tareas/anotaciones desde /api/projects/<id>/export?exportType=JSON.
+4. Convierte anotaciones a dataset YOLO temporal con convert_to_yolo_dataset.
+5. Lanza Ultralytics YOLO.train con data.yaml generado.
+6. Copia weights/best.pt a /app/data/models/project-<project_id>-<jobid>-best.pt.
+7. Carga el nuevo modelo como activo si termino bien.
+8. Persiste metadata del modelo y jobs.json.
+
+SPLIT TRAIN/VALID Y DATASET TEMPORAL
+Cambio reciente importante: antes se usaba train=images/train y val=images/train, o sea validacion reutilizaba exactamente las mismas imagenes de entrenamiento.
+Ahora existe un slider en la UI despues de Workers para elegir porcentaje de train.
+Default: 70% train y 30% valid.
+Backend: config key train_percent, default TRAIN_SPLIT_PERCENT=70. Se acepta por payload train_percent, alias train-percent o header X-Train-Train-Percent.
+El porcentaje se clamp-ea entre 1 y 100.
+
+Como se implementa sin modificar almacenamiento fisico de Label Studio:
+YOLO/Ultralytics permite que train y val en data.yaml apunten a manifiestos .txt con rutas de imagenes.
+YOLO NO acepta un manifiesto independiente de labels. Deriva las labels por convencion desde la ruta de imagen: images/... -> labels/... con mismo stem y extension .txt.
+Por eso el backend crea un dataset temporal dentro de /app/data/training/project-<id>-<timestamp>/ con esta estructura:
+images/all/: symlinks a imagenes originales si la imagen existe como archivo local estable. Si la imagen fue descargada temporalmente desde URL remota, se copia al dataset porque no hay ruta estable para symlink.
+labels/all/: labels YOLO generadas desde las anotaciones RectangleLabels de Label Studio.
+train.txt: manifiesto con rutas absolutas a imagenes/symlinks de train.
+val.txt: manifiesto con rutas absolutas a imagenes/symlinks de validacion.
+data.yaml: contiene path, train=<train.txt absoluto>, val=<val.txt absoluto>, names.
+
+Esto NO modifica las imagenes originales de Label Studio. Solo crea artefactos temporales propios del entrenamiento en /app/data/training. Las labels YOLO son generadas porque Label Studio no las guarda nativamente en layout YOLO.
+
+Split deterministico:
+convert_to_yolo_dataset crea samples con hash sha256 de project_id, task id, image_value y nombre target. Ordena por hash y corta segun train_percent. Esto evita que el split cambie aleatoriamente entre ejecuciones con el mismo conjunto.
+
+Conteos guardados:
+dataset_info se guarda en el job y metadata del modelo con:
+images: total de imagenes fisicas anotadas validas usadas.
+train_percent.
+val_percent.
+train_images: cantidad fisica de imagenes de entrenamiento.
+val_images: cantidad fisica de imagenes de validacion.
+train_manifest.
+val_manifest.
+image_storage: "symlink_manifest".
+
+Caso 100% train:
+Si train_percent=100, val_images=0 y train_async pasa val=False a YOLO.train para evitar falla por manifiesto de validacion vacio.
+
+UI WEB
+La UI esta embebida como HTML/CSS/JS dentro de app.py, funcion index().
+Secciones principales:
+Jobs.
+Lanzar entrenamiento.
+Modelo activo para inferencia.
+Estado.
+Metricas YOLO del job.
+Curvas de entrenamiento.
+Best y paciencia.
+Modelos entrenados.
+
+Cambios recientes de UI:
+Despues del input Workers se agrego slider Train split.
+Muestra en vivo: X% train / Y% valid.
+Al enviar el form convierte train_percent a Number y lo manda a /train.
+El notice de envio incluye split X/Y.
+Las cards de jobs muestran Train <n> / Valid <n> (<percent>%).
+Las cards de jobs muestran Best epoca y, cuando existe, el valor mAP50-95 del Best.
+La card Estado muestra Imagenes train, Imagenes valid y Split train del job seleccionado o modelo seleccionado.
+El listado de Modelos entrenados muestra una columna mAP50-95 con el best_metric guardado en metadata, o n/d si no hay metrica.
+El formulario Lanzar entrenamiento persiste sus valores en localStorage del browser con clave yolo11.trainForm y los restaura al recargar la pagina; si no hay valores guardados usa los defaults del HTML/backend.
+En Metricas YOLO del job, la metrica mAP50-95 se renderiza con clase metric-highlight para que sobresalga visualmente.
+El campo Proyecto Label Studio en Lanzar entrenamiento es un select alimentado desde /api/projects de Label Studio. Muestra id y titulo logico del proyecto. Si no se pueden cargar proyectos, muestra una opcion deshabilitada y un aviso; el entrenamiento requiere seleccionar un proyecto existente. La restauracion desde localStorage solo aplica si el proyecto guardado todavia existe entre las opciones.
+El selector Modelo base incluye modelos externos y modelos entrenados. Los modelos externos se muestran siempre, arriba de la lista, y la fuente se etiqueta como externo. Los modelos entrenados se filtran por el Proyecto Label Studio seleccionado. Todas las opciones del selector muestran tamano en MB. Al lado del selector hay carga de archivo .pt para subir un modelo externo; se guarda en /app/data/external-models y no aparece en la tabla Modelos entrenados.
+El formulario Lanzar entrenamiento incluye parametros avanzados recomendados: lr0, weight_decay y cos_lr. Se guardan en train_config, se persisten en localStorage con el resto del formulario y se pasan directo a YOLO.train como lr0, weight_decay y cos_lr.
+
+METRICAS Y MODELOS
+public_job agrega metrics si hay run_dir, leyendo results.csv con yolo_metrics.
+training_artifact_summary calcula existencia/path de best.pt/last.pt, mejor mAP50-95, best_epoch, current_epoch y paciencia restante.
+write_model_metadata guarda public_job(job) + saved_at junto al .pt.
+read_model_metadata intenta leer <modelo>.json; si no existe, inferred_model_metadata intenta inferir desde nombre project-*-best.pt y run_dir.
+model_option_label muestra nombre, fuente, fecha y mAP50-95 si hay metadata.
+Los modelos entrenados se asocian a proyecto mediante metadata.project. Si un modelo entrenado antiguo no trae metadata.project, se infiere desde el nombre project-<id>-...; como fallback para modelos legacy se asume proyecto 19. Los modelos entrenados existentes al momento de este cambio ya tenian project: 19 en sus JSON.
+Los modelos externos viven en /app/data/external-models, se listan solo como alternativas de modelo base/activo y no se incluyen en model_files(), por lo tanto no aparecen en la tabla de modelos entrenados.
+
+COMANDOS DE DESARROLLO Y VERIFICACION
+Compilar sintaxis Python desde el host:
+python3 -m py_compile "yolo11-backend/app.py"
+
+Construir imagen Docker:
+docker build -t yolo11-label-studio-backend:latest "yolo11-backend"
+
+Recrear solo backend despues de cambios:
+docker compose up -d --force-recreate yolo11-backend
+
+Como app.py esta montado como volumen, para cambios solo en app.py tambien puede alcanzar con:
+docker compose restart yolo11-backend
+pero en la ultima preparacion de version se construyo imagen y se recreo el servicio.
+
+Verificar contenedor:
+docker compose ps yolo11-backend
+
+Verificar health:
+curl -fsS http://localhost:9090/health
+
+Verificar status:
+curl -fsS http://localhost:9090/status
+
+Ver logs recientes:
+docker compose logs --no-color --since=2m yolo11-backend
+
+ULTIMA VERIFICACION REALIZADA
+Fecha del entorno: Thu Jun 25 2026.
+Se ejecuto python3 -m py_compile yolo11-backend/app.py sin errores.
+Se construyo la imagen yolo11-label-studio-backend:latest correctamente.
+Se ejecuto docker compose up -d --force-recreate yolo11-backend correctamente.
+/health respondio: status UP, model_path /models/precintos-s.pt, training false.
+/status mostro GPU disponible con 2 dispositivos: NVIDIA GeForce RTX 5060 Ti y NVIDIA GeForce RTX 2060, train_device auto, train_percent 70.
+Logs recientes no mostraron errores de arranque.
+Hubo warning de contenedores huerfanos de otros servicios del proyecto Compose; no se removieron porque no correspondia al alcance.
+
+CONSIDERACIONES Y RIESGOS
+No usar comandos destructivos como git reset --hard o git checkout -- sin aprobacion explicita.
+El worktree puede estar sucio; no revertir cambios ajenos.
+La UI esta en un string HTML grande dentro de app.py; revisar cuidadosamente llaves dobles {{ }} por ser f-string de Python con JavaScript embebido.
+Si se agregan variables al compose, recordar que app.py tiene default pero compose podria no exponerlas. Actualmente TRAIN_SPLIT_PERCENT tiene default en app.py y no fue agregado al docker-compose.yml.
+El servicio usa image sin build en docker-compose.yml; docker compose up --build no reconstruye automaticamente esta imagen. Hay que ejecutar docker build manualmente si se quiere actualizar la imagen.
+Como app.py esta montado por volumen, el contenedor ejecuta el app.py del host, no necesariamente el copiado en la imagen.
+Los datasets temporales bajo /app/data/training se eliminan cuando se elimina un job mediante DELETE /api/jobs/<id>, porque delete_job_artifacts borra el directorio padre de dataset_yaml.
+No hay tests automatizados dedicados para el split; la verificacion realizada fue compilacion Python y arranque Docker.
+
+ARCHIVOS MODIFICADOS RECIENTEMENTE
+/m2data/infra-label-studio/infra/yolo11-backend/app.py:
+Agregado TRAIN_SPLIT_PERCENT.
+Agregado train_percent en request_train_config.
+convert_to_yolo_dataset ahora genera split train/valid con manifiestos y symlinks/copia temporal segun origen.
+train_async guarda dataset_info y desactiva validacion si val_images=0.
+UI agrega slider Train split y muestra conteos en cards/estado.
+UI de cards de jobs actualizada para mostrar mAP50-95 junto a la epoca del Best cuando hay metrica disponible.
+UI de Modelos entrenados actualizada con columna mAP50-95.
+UI de Lanzar entrenamiento actualizada para guardar/restaurar valores del formulario desde localStorage.
+UI de Metricas YOLO actualizada para destacar visualmente mAP50-95.
+UI de Lanzar entrenamiento actualizada para reemplazar el input numerico de proyecto por un select de proyectos existentes en Label Studio, mostrando id y titulo.
+UI de Lanzar entrenamiento actualizada para permitir upload de modelos externos .pt como modelo base, mostrar tamano MB en el selector y filtrar modelos entrenados por proyecto seleccionado.
+UI/backend de entrenamiento actualizados para configurar lr0, weight_decay y cos_lr.
+
+/m2data/infra-label-studio/infra/yolo11-backend/contexto_proyecto.txt:
+Este archivo de contexto fue creado para futuros agentes.

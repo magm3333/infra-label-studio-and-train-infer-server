@@ -39,11 +39,16 @@ TRAIN_IMGSZ = int(os.getenv("TRAIN_IMGSZ", "640"))
 TRAIN_BATCH = int(os.getenv("TRAIN_BATCH", "8"))
 TRAIN_PATIENCE = int(os.getenv("TRAIN_PATIENCE", "20"))
 TRAIN_WORKERS = int(os.getenv("TRAIN_WORKERS", "2"))
+TRAIN_SPLIT_PERCENT = int(os.getenv("TRAIN_SPLIT_PERCENT", "70"))
+TRAIN_LR0 = float(os.getenv("TRAIN_LR0", "0.01"))
+TRAIN_WEIGHT_DECAY = float(os.getenv("TRAIN_WEIGHT_DECAY", "0.0005"))
+TRAIN_COS_LR = os.getenv("TRAIN_COS_LR", "false").lower() in ("1", "true", "yes", "on")
 TRAIN_DEVICE = os.getenv("TRAIN_DEVICE", "auto")
 
 DATA_DIR = Path("/app/data")
 RUNS_DIR = DATA_DIR / "runs"
 TRAIN_DIR = DATA_DIR / "training"
+EXTERNAL_MODELS_DIR = DATA_DIR / "external-models"
 JOBS_PATH = DATA_DIR / "jobs.json"
 LS_DATA_DIR = Path("/label-studio/data")
 LS_ENV_PATH = LS_DATA_DIR / ".env"
@@ -229,6 +234,11 @@ def request_train_config(payload):
                 return payload[candidate]
         return default
 
+    train_percent = int(value("train_percent", TRAIN_SPLIT_PERCENT, "train-percent", "Train-Percent"))
+    train_percent = min(max(train_percent, 1), 100)
+    cos_lr = value("cos_lr", TRAIN_COS_LR, "cos-lr", "Cos-Lr")
+    if isinstance(cos_lr, str):
+        cos_lr = cos_lr.lower() in ("1", "true", "yes", "on")
     return {
         "model_path": value("model_path", TRAIN_MODEL_PATH, "model-path", "Model-Path"),
         "epochs": int(value("epochs", TRAIN_EPOCHS, "Epochs")),
@@ -236,6 +246,10 @@ def request_train_config(payload):
         "batch": int(value("batch", TRAIN_BATCH, "Batch")),
         "patience": int(value("patience", TRAIN_PATIENCE, "Patience")),
         "workers": int(value("workers", TRAIN_WORKERS, "Workers")),
+        "train_percent": train_percent,
+        "lr0": float(value("lr0", TRAIN_LR0, "learning_rate", "Learning-Rate", "Lr0")),
+        "weight_decay": float(value("weight_decay", TRAIN_WEIGHT_DECAY, "weight-decay", "Weight-Decay")),
+        "cos_lr": bool(cos_lr),
         "device": value("device", TRAIN_DEVICE, "Device"),
     }
 
@@ -310,6 +324,25 @@ def ls_get(path):
     return response.json()
 
 
+def label_studio_projects():
+    try:
+        data = ls_get("/api/projects")
+        items = data.get("results", data) if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return []
+        projects = []
+        for item in items:
+            project_id = item.get("id")
+            if project_id is None:
+                continue
+            title = item.get("title") or item.get("name") or f"Proyecto {project_id}"
+            projects.append({"id": project_id, "title": str(title)})
+        return sorted(projects, key=lambda item: str(item["title"]).lower())
+    except Exception as exc:
+        app.logger.warning("Could not load Label Studio projects: %s", exc)
+        return []
+
+
 def export_project(project_id):
     response = requests.get(
         f"{LABEL_STUDIO_URL}/api/projects/{project_id}/export",
@@ -332,10 +365,10 @@ def annotation_results(task):
     return []
 
 
-def convert_to_yolo_dataset(project_id, tasks):
+def convert_to_yolo_dataset(project_id, tasks, train_percent):
     run_dir = TRAIN_DIR / f"project-{project_id}-{int(time.time())}"
-    images_dir = run_dir / "images" / "train"
-    labels_dir = run_dir / "labels" / "train"
+    images_dir = run_dir / "images" / "all"
+    labels_dir = run_dir / "labels" / "all"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
 
@@ -343,7 +376,7 @@ def convert_to_yolo_dataset(project_id, tasks):
     if not names:
         raise ValueError("No labels found in Label Studio config or YOLO model")
 
-    count = 0
+    samples = []
     for task in tasks:
         results = annotation_results(task)
         if not results:
@@ -356,7 +389,12 @@ def convert_to_yolo_dataset(project_id, tasks):
                 continue
             height, width = image.shape[:2]
             target_image = images_dir / f"{task.get('id', uuid.uuid4())}{Path(image_path).suffix or '.jpg'}"
-            shutil.copyfile(image_path, target_image)
+            if target_image.exists() or target_image.is_symlink():
+                target_image.unlink()
+            if temporary:
+                shutil.copyfile(image_path, target_image)
+            else:
+                target_image.symlink_to(Path(image_path).resolve())
             lines = []
             for item in results:
                 value = item.get("value", {})
@@ -371,17 +409,38 @@ def convert_to_yolo_dataset(project_id, tasks):
                 lines.append(f"{class_id} {x + w / 2:.6f} {y + h / 2:.6f} {w:.6f} {h:.6f}")
             if lines:
                 (labels_dir / f"{target_image.stem}.txt").write_text("\n".join(lines) + "\n")
-                count += 1
+                split_key = f"{project_id}:{task.get('id', '')}:{image_value}:{target_image.name}"
+                samples.append((hashlib.sha256(split_key.encode()).hexdigest(), target_image))
         finally:
             if temporary:
                 Path(image_path).unlink(missing_ok=True)
 
-    if count == 0:
+    if not samples:
         raise ValueError("No annotated rectangle labels found to train")
 
+    samples.sort(key=lambda item: item[0])
+    train_count = round(len(samples) * train_percent / 100)
+    train_count = min(max(train_count, 1), len(samples))
+    train_images = [path for _, path in samples[:train_count]]
+    val_images = [path for _, path in samples[train_count:]]
+    train_manifest = run_dir / "train.txt"
+    val_manifest = run_dir / "val.txt"
+    train_manifest.write_text("\n".join(str(path) for path in train_images) + "\n")
+    val_manifest.write_text("\n".join(str(path) for path in val_images) + ("\n" if val_images else ""))
+
     data_yaml = run_dir / "data.yaml"
-    data_yaml.write_text(yaml.safe_dump({"path": str(run_dir), "train": "images/train", "val": "images/train", "names": names}))
-    return data_yaml, count
+    data_yaml.write_text(yaml.safe_dump({"path": str(run_dir), "train": str(train_manifest), "val": str(val_manifest), "names": names}))
+    dataset_info = {
+        "images": len(samples),
+        "train_percent": train_percent,
+        "val_percent": 100 - train_percent,
+        "train_images": len(train_images),
+        "val_images": len(val_images),
+        "train_manifest": str(train_manifest),
+        "val_manifest": str(val_manifest),
+        "image_storage": "symlink_manifest",
+    }
+    return data_yaml, dataset_info
 
 
 def public_job(job):
@@ -594,12 +653,27 @@ load_jobs()
 
 def job_card_html(job):
     cancel = f"<button type='button' class='cancel-job' data-cancel-job='{html.escape(job['id'])}'>Cancelar</button>" if job.get("status") == "running" else ""
-    best_epoch = (job.get("metrics") or {}).get("summary", {}).get("best_epoch")
-    best_text = f"Best época {best_epoch}" if best_epoch is not None else "Best n/d"
+    summary = (job.get("metrics") or {}).get("summary", {})
+    best_epoch = summary.get("best_epoch")
+    best_metric = summary.get("best_metric")
+    if best_epoch is not None and isinstance(best_metric, (int, float)):
+        best_text = f"Best época {best_epoch} · mAP50-95 {best_metric:.4f}"
+    elif best_epoch is not None:
+        best_text = f"Best época {best_epoch}"
+    else:
+        best_text = "Best n/d"
+    dataset = job.get("dataset") or {}
+    if dataset:
+        dataset_text = f"Train {dataset.get('train_images', 0)} / Valid {dataset.get('val_images', 0)} ({dataset.get('train_percent', 0)}%)"
+    elif job.get("images"):
+        dataset_text = f"Imágenes {job.get('images')}"
+    else:
+        dataset_text = "Dataset pendiente"
     return f"""
     <div class='job-card' data-job='{html.escape(job['id'])}'>
       <span class='status {html.escape(job['status'])}'>{html.escape(job['status'])}</span>
       <strong>Proyecto {html.escape(str(job['project']))}</strong>
+      <span>{html.escape(dataset_text)}</span>
       <span class='duration' data-start='{job.get('started_at', job.get('created_at', 0))}' data-finished='{job.get('finished_at', '')}'>{html.escape(format_duration(job.get('elapsed_seconds', 0)))}</span>
       <span class='epoch' data-job-epoch='{html.escape(job['id'])}'>Época {job.get('progress', {}).get('current_epoch', 0)}/{job.get('progress', {}).get('total_epochs', 0)}</span>
       <span class='best-epoch' data-job-best='{html.escape(job['id'])}'>{html.escape(best_text)}</span>
@@ -628,16 +702,58 @@ def model_files():
     return files
 
 
+def external_model_files():
+    if not EXTERNAL_MODELS_DIR.exists():
+        return []
+    files = []
+    for path in sorted(EXTERNAL_MODELS_DIR.glob("*.pt"), key=lambda item: item.stat().st_mtime, reverse=True):
+        stat = path.stat()
+        files.append({
+            "name": path.name,
+            "path": str(path),
+            "size": stat.st_size,
+            "modified_at": stat.st_mtime,
+            "active": str(path) == state["model_path"],
+            "source": "externo",
+            "project": None,
+        })
+    return files
+
+
+def model_project(item):
+    metadata = item.get("metadata") or read_model_metadata(item.get("path")) or {}
+    project = metadata.get("project")
+    if project is not None:
+        return str(project)
+    name = str(item.get("name") or Path(str(item.get("path", ""))).name)
+    if name.startswith("project-"):
+        parts = name.removeprefix("project-").split("-", 1)
+        if parts and parts[0].isdigit():
+            return parts[0]
+    return "19"
+
+
+def model_size_mb(path):
+    try:
+        return Path(path).stat().st_size / 1024 / 1024
+    except OSError:
+        return None
+
+
 def available_model_options():
     options = []
     seen = set()
     for path in [Path(MODEL_PATH), Path(TRAIN_MODEL_PATH)]:
         if str(path) not in seen:
-            options.append({"name": path.name, "path": str(path), "source": "inicial", "active": str(path) == state["model_path"]})
+            options.append({"name": path.name, "path": str(path), "source": "externo", "active": str(path) == state["model_path"], "project": None, "size": path.stat().st_size if path.exists() else 0})
             seen.add(str(path))
+    for item in external_model_files():
+        if item["path"] not in seen:
+            options.append(item)
+            seen.add(item["path"])
     for item in model_files():
         if item["path"] not in seen:
-            options.append({"name": item["name"], "path": item["path"], "source": "entrenado", "active": item["active"]})
+            options.append({"name": item["name"], "path": item["path"], "source": "entrenado", "active": item["active"], "project": model_project(item), "size": item["size"]})
             seen.add(item["path"])
     return options
 
@@ -654,7 +770,17 @@ def model_option_label(item):
         trained_at = path.stat().st_mtime
     date = time.strftime("%Y-%m-%d %H:%M", time.localtime(trained_at)) if trained_at else "sin fecha"
     metric = f"mAP50-95 {map5095:.4f}" if isinstance(map5095, (int, float)) else "mAP50-95 n/d"
-    return f"{item['name']} · {item['source']} · {date} · {metric}"
+    size = model_size_mb(item["path"])
+    size_label = f"{size:.1f} MB" if size is not None else "tamano n/d"
+    project = item.get("project")
+    project_label = f" · proyecto {project}" if item.get("source") == "entrenado" and project is not None else ""
+    return f"{item['name']} · {item['source']}{project_label} · {size_label} · {date} · {metric}"
+
+
+def model_map5095(model):
+    metadata = model.get("metadata") or {}
+    value = (metadata.get("metrics", {}).get("summary", {}) or {}).get("best_metric")
+    return f"{value:.4f}" if isinstance(value, (int, float)) else "n/d"
 
 
 def train_async(job_id, project_id, config):
@@ -673,8 +799,9 @@ def train_async(job_id, project_id, config):
         jobs[job_id].update({"label_config": project.get("label_config"), "task_count": len(tasks)})
         jobs[job_id].update({"phase": "converting_dataset", "message": "Convirtiendo anotaciones a formato YOLO"})
         save_jobs()
-        data_yaml, image_count = convert_to_yolo_dataset(project_id, tasks)
-        jobs[job_id].update({"dataset_yaml": str(data_yaml), "images": image_count})
+        data_yaml, dataset_info = convert_to_yolo_dataset(project_id, tasks, config["train_percent"])
+        image_count = dataset_info["images"]
+        jobs[job_id].update({"dataset_yaml": str(data_yaml), "images": image_count, "dataset": dataset_info})
         run_name = f"project-{project_id}-{job_id[:8]}"
         run_dir = RUNS_DIR / run_name
         jobs[job_id]["run_dir"] = str(run_dir)
@@ -688,9 +815,13 @@ def train_async(job_id, project_id, config):
             "batch": config["batch"],
             "patience": config["patience"],
             "workers": config["workers"],
+            "lr0": config["lr0"],
+            "weight_decay": config["weight_decay"],
+            "cos_lr": config["cos_lr"],
             "project": str(RUNS_DIR),
             "name": run_name,
             "exist_ok": False,
+            "val": dataset_info["val_images"] > 0,
         }
         device = resolved_train_device(config)
         if device is not None:
@@ -707,7 +838,7 @@ def train_async(job_id, project_id, config):
         if jobs[job_id].get("trained_model"):
             write_model_metadata(jobs[job_id]["trained_model"], jobs[job_id])
         save_jobs()
-        state["last_train_status"] = {"status": "completed", "project": project_id, "images": image_count, "model_path": state["model_path"], "train_config": config, "job_id": job_id}
+        state["last_train_status"] = {"status": "completed", "project": project_id, "images": image_count, "dataset": dataset_info, "model_path": state["model_path"], "train_config": config, "job_id": job_id}
     except Exception as exc:
         jobs[job_id].update({"status": "failed", "phase": "failed", "message": "El entrenamiento fallo", "finished_at": time.time(), "error": str(exc)})
         save_jobs()
@@ -828,6 +959,27 @@ def api_models():
     return jsonify({"models": model_files(), "available_models": available_model_options(), "active_model_path": state["model_path"]})
 
 
+@app.post("/api/external-models")
+def api_upload_external_model():
+    upload = request.files.get("model")
+    if not upload or not upload.filename:
+        return jsonify({"status": "error", "message": "model file is required"}), 400
+    filename = Path(upload.filename).name
+    if not filename.endswith(".pt"):
+        return jsonify({"status": "error", "message": "Only .pt model files are supported"}), 400
+    import re
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip(".-") or f"model-{int(time.time())}.pt"
+    if not safe_name.endswith(".pt"):
+        safe_name = f"{safe_name}.pt"
+    EXTERNAL_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    target = EXTERNAL_MODELS_DIR / safe_name
+    if target.exists():
+        target = EXTERNAL_MODELS_DIR / f"{target.stem}-{int(time.time())}{target.suffix}"
+    upload.save(target)
+    return jsonify({"status": "ok", "model": {"name": target.name, "path": str(target), "size": target.stat().st_size, "source": "externo"}})
+
+
 @app.post("/api/active-model")
 def api_active_model():
     payload = request.get_json(force=True, silent=True) or {}
@@ -861,6 +1013,10 @@ def status():
         "batch": TRAIN_BATCH,
         "patience": TRAIN_PATIENCE,
         "workers": TRAIN_WORKERS,
+        "train_percent": TRAIN_SPLIT_PERCENT,
+        "lr0": TRAIN_LR0,
+        "weight_decay": TRAIN_WEIGHT_DECAY,
+        "cos_lr": TRAIN_COS_LR,
         "device": TRAIN_DEVICE,
     }})
 
@@ -875,12 +1031,13 @@ def index():
         <tr>
           <td>{html.escape(model['name'])}{' <span class="pill">activo</span>' if model['active'] else ''}</td>
           <td>{model['size'] / 1024 / 1024:.1f} MB</td>
+          <td>{html.escape(model_map5095(model))}</td>
           <td>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(model['modified_at']))}</td>
           <td class='row-actions'><button type='button' class='mini' data-model='{html.escape(model['name'])}'>Ver métricas</button><a class='download' href='/download/models/{html.escape(model['name'])}'>Descargar</a></td>
         </tr>
         """
         for model in model_files()
-    ]) or "<tr><td colspan='4' class='empty'>Todavia no hay modelos entrenados.</td></tr>"
+    ]) or "<tr><td colspan='5' class='empty'>Todavia no hay modelos entrenados.</td></tr>"
     selected_json = html.escape(json.dumps(selected_job or {}, indent=2, ensure_ascii=False))
     latest_metrics = (selected_job or {}).get("metrics", {}).get("latest", {}) if selected_job else {}
     selected_metric_rows = (selected_job or {}).get("metrics", {}).get("rows", []) if selected_job else []
@@ -902,7 +1059,7 @@ def index():
         ("lr/pg2", "LR pg2"),
     ]
     metric_rows = "".join(
-        f"<div class='metric-cell'><small>{html.escape(label)}</small><strong>{html.escape(str(latest_metrics.get(key, '')))}</strong></div>"
+        f"<div class='metric-cell {'metric-highlight' if key == 'metrics/mAP50-95(B)' else ''}'><small>{html.escape(label)}</small><strong>{html.escape(str(latest_metrics.get(key, '')))}</strong></div>"
         for key, label in metric_labels
     ) if latest_metrics else "<div class='empty'>Sin metricas todavia. Aparecen cuando Ultralytics escribe results.csv.</div>"
     charts_html = "".join([
@@ -922,19 +1079,31 @@ def index():
     ]) if selected_summary else "<tr><td colspan='2' class='empty'>Sin información de best/paciencia todavía.</td></tr>"
     selected_message = html.escape(str((selected_job or {}).get("message", "Selecciona un job para ver su estado.")))
     selected_phase = html.escape(str((selected_job or {}).get("phase", (selected_job or {}).get("status", "idle"))))
+    selected_dataset = (selected_job or {}).get("dataset") or {}
+    selected_train_images = html.escape(str(selected_dataset.get("train_images", "n/d")))
+    selected_val_images = html.escape(str(selected_dataset.get("val_images", "n/d")))
+    selected_split_value = selected_dataset.get("train_percent")
+    selected_split = html.escape(f"{selected_split_value}%" if selected_split_value is not None else "n/d")
     initial_selected_job_id = json.dumps((selected_job or {}).get("id"))
     initial_selected_job_status = json.dumps((selected_job or {}).get("status"))
     devices = gpu_status().get("cuda_devices", [])
     device_options = "<option value='auto'>auto</option><option value='cpu'>cpu</option>" + "".join(
         f"<option value='{index}'>{index} - {html.escape(name)}</option>" for index, name in enumerate(devices)
     )
+    projects = label_studio_projects()
+    project_options = "".join(
+        f"<option value='{html.escape(str(project['id']))}'>{html.escape(str(project['id']))} - {html.escape(project['title'])}</option>"
+        for project in projects
+    ) or "<option value='' disabled selected>No se pudieron cargar proyectos</option>"
+    project_notice = "" if projects else "<div class='notice'>No se pudieron cargar proyectos desde Label Studio. Revisa conectividad/API key antes de entrenar.</div>"
+    available_options = available_model_options()
     model_options = "".join(
-        f"<option value='{html.escape(item['path'])}' {'selected' if item['path'] == TRAIN_MODEL_PATH else ''}>{html.escape(model_option_label(item))}</option>"
-        for item in available_model_options()
+        f"<option value='{html.escape(item['path'])}' data-source='{html.escape(item.get('source', ''))}' data-project='{html.escape(str(item.get('project') or ''))}' {'selected' if item['path'] == TRAIN_MODEL_PATH else ''}>{html.escape(model_option_label(item))}</option>"
+        for item in available_options
     )
     active_model_options = "".join(
         f"<option value='{html.escape(item['path'])}' {'selected' if item['active'] else ''}>{html.escape(model_option_label(item))}</option>"
-        for item in available_model_options()
+        for item in available_options
     )
     return f"""
 <!doctype html>
@@ -963,6 +1132,9 @@ def index():
     .metric-cell {{ background:#091120; border:1px solid var(--line); border-radius:14px; padding:12px; min-height:76px; }}
     .metric-cell small {{ color:var(--muted); display:block; margin-bottom:7px; font-size:12px; }}
     .metric-cell strong {{ font-size:15px; overflow-wrap:anywhere; }}
+    .metric-highlight {{ background:linear-gradient(135deg,rgba(112,224,0,.28),rgba(76,201,240,.15)); border-color:var(--accent); box-shadow:0 0 0 1px rgba(112,224,0,.25), 0 16px 40px rgba(112,224,0,.14); transform:scale(1.02); }}
+    .metric-highlight small {{ color:#caffbf; }}
+    .metric-highlight strong {{ color:var(--accent); font-size:26px; letter-spacing:-0.03em; }}
     details {{ border:1px solid var(--line); border-radius:16px; background:#070b13; overflow:hidden; }}
     summary {{ cursor:pointer; padding:14px 16px; color:var(--text); font-weight:800; }}
     details pre {{ border:0; border-top:1px solid var(--line); border-radius:0; }}
@@ -986,6 +1158,8 @@ def index():
     .form-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }}
     label {{ display:grid; gap:6px; color:var(--muted); font-size:13px; font-weight:700; }}
     input,select {{ width:100%; border:1px solid var(--line); border-radius:12px; background:#090f1d; color:var(--text); padding:11px 12px; font:inherit; }}
+    input[type='file'] {{ padding:9px 10px; }}
+    input[type='range'] {{ padding:0; accent-color:var(--accent); }}
     input:focus,select:focus {{ outline:2px solid rgba(112,224,0,.35); border-color:var(--accent); }}
     .notice {{ margin-top:10px; color:var(--muted); min-height:22px; }}
     .job-message {{ margin-bottom:14px; border:1px solid var(--line); background:#091120; border-radius:16px; padding:14px; display:flex; justify-content:space-between; gap:12px; align-items:center; }}
@@ -1018,15 +1192,22 @@ def index():
         <h2>Lanzar entrenamiento</h2>
         <form id='train-form'>
           <div class='form-grid'>
-            <label>Proyecto Label Studio<input name='project' type='number' min='1' value='19' required></label>
+            <label>Proyecto Label Studio<select name='project' required>{project_options}</select></label>
             <label>Modelo base<select name='model_path'>{model_options}</select></label>
+            <label>Modelo externo <span>Subir .pt para usar como base</span><input id='external-model-file' type='file' accept='.pt'></label>
             <label>Device<select name='device'>{device_options}</select></label>
             <label>Epochs<input name='epochs' type='number' min='1' value='{TRAIN_EPOCHS}' required></label>
             <label>Image size<input name='imgsz' type='number' min='32' step='32' value='{TRAIN_IMGSZ}' required></label>
             <label>Batch<input name='batch' type='number' min='1' value='{TRAIN_BATCH}' required></label>
             <label>Patience<input name='patience' type='number' min='0' value='{TRAIN_PATIENCE}' required></label>
             <label>Workers<input name='workers' type='number' min='0' value='{TRAIN_WORKERS}' required></label>
+            <label>Learning rate lr0<input name='lr0' type='number' min='0' step='0.0001' value='{TRAIN_LR0}' required></label>
+            <label>Weight decay<input name='weight_decay' type='number' min='0' step='0.00001' value='{TRAIN_WEIGHT_DECAY}' required></label>
+            <label>Cosine LR <select name='cos_lr'><option value='false' {'selected' if not TRAIN_COS_LR else ''}>no</option><option value='true' {'selected' if TRAIN_COS_LR else ''}>si</option></select></label>
+            <label>Train split <span><strong id='train-percent-value'>{TRAIN_SPLIT_PERCENT}%</strong> train / <strong id='val-percent-value'>{100 - TRAIN_SPLIT_PERCENT}%</strong> valid</span><input id='train-percent' name='train_percent' type='range' min='1' max='100' value='{TRAIN_SPLIT_PERCENT}' required></label>
           </div>
+          <button class='mini' type='button' id='upload-external-model'>Subir modelo externo</button>
+          {project_notice}
           <button class='btn' type='submit'>Iniciar entrenamiento</button>
           <div id='train-notice' class='notice'></div>
         </form>
@@ -1047,6 +1228,9 @@ def index():
           <div class='metric'><small>Modelo activo</small><strong>{html.escape(Path(state['model_path']).name)}</strong></div>
           <div class='metric'><small>Entrenando</small><strong>{'si' if state['training'] else 'no'}</strong></div>
           <div class='metric'><small>GPU</small><strong>{html.escape(', '.join(gpu_status().get('cuda_devices', [])) or 'sin CUDA')}</strong></div>
+          <div class='metric'><small>Imágenes train</small><strong id='status-train-images'>{selected_train_images}</strong></div>
+          <div class='metric'><small>Imágenes valid</small><strong id='status-val-images'>{selected_val_images}</strong></div>
+          <div class='metric'><small>Split train</small><strong id='status-train-split'>{selected_split}</strong></div>
         </div>
         <details>
           <summary>Detalle del job seleccionado</summary>
@@ -1067,14 +1251,109 @@ def index():
       </section>
       <section style='margin-top:18px'>
         <h2>Modelos entrenados</h2>
-        <table><thead><tr><th>Modelo</th><th>Tamano</th><th>Modificado</th><th></th></tr></thead><tbody>{model_rows}</tbody></table>
+        <table><thead><tr><th>Modelo</th><th>Tamano</th><th>mAP50-95</th><th>Modificado</th><th></th></tr></thead><tbody>{model_rows}</tbody></table>
       </section>
     </div>
   </main>
   <script>
     let selectedJobId = {initial_selected_job_id};
     let selectedJobStatus = {initial_selected_job_status};
+    const trainForm = document.getElementById('train-form');
+    const trainFormStorageKey = 'yolo11.trainForm';
+    restoreTrainForm();
+    bindTrainSplitSlider();
+    bindTrainFormStorage();
+    bindProjectModelFilter();
+    bindExternalModelUpload();
+    filterBaseModels();
     bindJobEvents();
+    function trainFormData() {{
+      return Object.fromEntries(new FormData(trainForm).entries());
+    }}
+    function restoreTrainForm() {{
+      try {{
+        const saved = JSON.parse(localStorage.getItem(trainFormStorageKey) || '{{}}');
+        Object.entries(saved).forEach(([key, value]) => {{
+          const field = trainForm.elements[key];
+          if (!field) return;
+          if (field.tagName === 'SELECT' && !Array.from(field.options).some(option => option.value === String(value))) return;
+          field.value = value;
+        }});
+      }} catch (error) {{
+        console.warn('No se pudo restaurar el formulario de entrenamiento', error);
+      }}
+    }}
+    function saveTrainForm() {{
+      localStorage.setItem(trainFormStorageKey, JSON.stringify(trainFormData()));
+    }}
+    function bindTrainFormStorage() {{
+      trainForm.addEventListener('input', saveTrainForm);
+      trainForm.addEventListener('change', saveTrainForm);
+    }}
+    function bindProjectModelFilter() {{
+      trainForm.elements.project.addEventListener('change', () => {{
+        filterBaseModels();
+        saveTrainForm();
+      }});
+    }}
+    function filterBaseModels() {{
+      const project = String(trainForm.elements.project.value || '');
+      const modelSelect = trainForm.elements.model_path;
+      let selectedVisible = false;
+      Array.from(modelSelect.options).forEach(option => {{
+        const visible = option.dataset.source !== 'entrenado' || option.dataset.project === project;
+        option.hidden = !visible;
+        option.disabled = !visible;
+        if (option.selected && visible) selectedVisible = true;
+      }});
+      if (!selectedVisible) {{
+        const firstVisible = Array.from(modelSelect.options).find(option => !option.disabled);
+        if (firstVisible) modelSelect.value = firstVisible.value;
+      }}
+    }}
+    function bindExternalModelUpload() {{
+      document.getElementById('upload-external-model').addEventListener('click', async () => {{
+        const notice = document.getElementById('train-notice');
+        const fileInput = document.getElementById('external-model-file');
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) {{ notice.textContent = 'Selecciona un archivo .pt para subir como modelo externo.'; return; }}
+        const data = new FormData();
+        data.append('model', file);
+        notice.textContent = 'Subiendo modelo externo...';
+        const res = await fetch('/api/external-models', {{method: 'POST', body: data}});
+        const body = await res.json().catch(() => ({{}}));
+        if (!res.ok) {{ notice.textContent = 'Error subiendo modelo externo: ' + (body.message || JSON.stringify(body)); return; }}
+        const saved = trainFormData();
+        saved.model_path = body.model.path;
+        localStorage.setItem(trainFormStorageKey, JSON.stringify(saved));
+        notice.textContent = 'Modelo externo cargado. Recargando opciones...';
+        setTimeout(() => location.reload(), 500);
+      }});
+    }}
+    function bindTrainSplitSlider() {{
+      const slider = document.getElementById('train-percent');
+      const trainValue = document.getElementById('train-percent-value');
+      const valValue = document.getElementById('val-percent-value');
+      const update = () => {{
+        const value = Number(slider.value);
+        trainValue.textContent = value + '%';
+        valValue.textContent = (100 - value) + '%';
+      }};
+      slider.addEventListener('input', update);
+      update();
+    }}
+    function setDatasetStatus(dataset) {{
+      dataset = dataset || {{}};
+      document.getElementById('status-train-images').textContent = dataset.train_images ?? 'n/d';
+      document.getElementById('status-val-images').textContent = dataset.val_images ?? 'n/d';
+      document.getElementById('status-train-split').textContent = dataset.train_percent === undefined ? 'n/d' : dataset.train_percent + '%';
+    }}
+    function renderMetricCells(latest, emptyText) {{
+      const labels = {json.dumps(metric_labels, ensure_ascii=False)};
+      return Object.keys(latest).length
+        ? labels.map(([key, label]) => `<div class='metric-cell ${{key === 'metrics/mAP50-95(B)' ? 'metric-highlight' : ''}}'><small>${{label}}</small><strong>${{latest[key] || ''}}</strong></div>`).join('')
+        : `<div class='empty'>${{emptyText}}</div>`;
+    }}
     function bindJobEvents() {{
       document.querySelectorAll('.job-card').forEach(btn => btn.onclick = async () => {{
         selectedJobId = btn.dataset.job;
@@ -1110,7 +1389,7 @@ def index():
       document.getElementById('job-detail').textContent = JSON.stringify(job, null, 2);
       document.getElementById('job-message').textContent = job.message || '';
       document.getElementById('job-phase').textContent = job.phase || job.status || '';
-      const labels = {json.dumps(metric_labels, ensure_ascii=False)};
+      setDatasetStatus(job.dataset);
       const latest = (job.metrics && job.metrics.latest) || {{}};
       const rows = (job.metrics && job.metrics.rows) || [];
       const summary = (job.metrics && job.metrics.summary) || {{}};
@@ -1118,13 +1397,14 @@ def index():
       if (epochEl && job.progress) epochEl.textContent = `Época ${{job.progress.current_epoch}}/${{job.progress.total_epochs}}`;
       const bestEl = document.querySelector(`[data-job-best='${{job.id}}']`);
       const bestEpoch = summary.best_epoch;
-      if (bestEl) bestEl.textContent = bestEpoch === null || bestEpoch === undefined ? 'Best n/d' : `Best época ${{bestEpoch}}`;
+      const bestMetric = Number(summary.best_metric);
+      if (bestEl) bestEl.textContent = bestEpoch === null || bestEpoch === undefined
+        ? 'Best n/d'
+        : (Number.isFinite(bestMetric) ? `Best época ${{bestEpoch}} · mAP50-95 ${{bestMetric.toFixed(4)}}` : `Best época ${{bestEpoch}}`);
       const errorBox = document.getElementById('job-error');
       if (job.error) {{ errorBox.style.display = 'block'; errorBox.textContent = 'Error: ' + job.error; }}
       else {{ errorBox.style.display = 'none'; errorBox.textContent = ''; }}
-      document.getElementById('metrics-body').innerHTML = Object.keys(latest).length
-        ? labels.map(([key, label]) => `<div class='metric-cell'><small>${{label}}</small><strong>${{latest[key] || ''}}</strong></div>`).join('')
-        : `<div class='empty'>Sin metricas todavia. Aparecen cuando Ultralytics escribe results.csv.</div>`;
+      document.getElementById('metrics-body').innerHTML = renderMetricCells(latest, 'Sin metricas todavia. Aparecen cuando Ultralytics escribe results.csv.');
       document.getElementById('best-body').innerHTML = Object.keys(summary).length
         ? [
             ['Best existe', summary.best_exists], ['Best path', summary.best_path], ['Best mAP50-95', summary.best_metric],
@@ -1185,7 +1465,7 @@ def index():
       }};
       return `<div class='chart'><div class='chart-head'><strong>${{title}} <span class='help' data-tip='${{tips[key] || ''}}'>?</span></strong><span>último: ${{values.at(-1).toFixed(4)}}</span></div><svg viewBox='0 0 560 180'><line x1='26' y1='154' x2='534' y2='154' class='axis'/><line x1='26' y1='26' x2='26' y2='154' class='axis'/><polyline points='${{points}}' fill='none' stroke='${{color}}' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/></svg><div class='chart-scale'><span>min ${{min.toFixed(4)}}</span><span>max ${{max.toFixed(4)}}</span></div></div>`;
     }}
-    document.getElementById('train-form').addEventListener('submit', async (event) => {{
+    trainForm.addEventListener('submit', async (event) => {{
       event.preventDefault();
       const notice = document.getElementById('train-notice');
       const data = Object.fromEntries(new FormData(event.currentTarget).entries());
@@ -1195,7 +1475,12 @@ def index():
       data.batch = Number(data.batch);
       data.patience = Number(data.patience);
       data.workers = Number(data.workers);
-      notice.textContent = `Enviando entrenamiento: ${{data.epochs}} epochs, paciencia ${{data.patience}}, batch ${{data.batch}}, workers ${{data.workers}}...`;
+      data.train_percent = Number(data.train_percent);
+      data.lr0 = Number(data.lr0);
+      data.weight_decay = Number(data.weight_decay);
+      data.cos_lr = data.cos_lr === 'true';
+      saveTrainForm();
+      notice.textContent = `Enviando entrenamiento: ${{data.epochs}} epochs, paciencia ${{data.patience}}, batch ${{data.batch}}, workers ${{data.workers}}, lr0 ${{data.lr0}}, wd ${{data.weight_decay}}, cos_lr ${{data.cos_lr ? 'si' : 'no'}}, split ${{data.train_percent}}/${{100 - data.train_percent}}...`;
       const res = await fetch('/train', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
@@ -1240,11 +1525,11 @@ def index():
       document.getElementById('job-detail').textContent = JSON.stringify(job, null, 2);
       document.getElementById('job-message').textContent = 'Métricas guardadas para ' + model.name;
       document.getElementById('job-phase').textContent = 'modelo guardado';
+      setDatasetStatus(job.dataset);
       const rows = (job.metrics && job.metrics.rows) || [];
       const latest = (job.metrics && job.metrics.latest) || {{}};
       const summary = (job.metrics && job.metrics.summary) || {{}};
-      const labels = {json.dumps(metric_labels, ensure_ascii=False)};
-      document.getElementById('metrics-body').innerHTML = Object.keys(latest).length ? labels.map(([key, label]) => `<div class='metric-cell'><small>${{label}}</small><strong>${{latest[key] || ''}}</strong></div>`).join('') : `<div class='empty'>Sin metricas guardadas.</div>`;
+      document.getElementById('metrics-body').innerHTML = renderMetricCells(latest, 'Sin metricas guardadas.');
       document.getElementById('best-body').innerHTML = Object.keys(summary).length ? [
         ['Best existe', summary.best_exists], ['Best path', summary.best_path], ['Best mAP50-95', summary.best_metric], ['Best epoch', summary.best_epoch], ['Epoch actual', summary.current_epoch], ['Epochs sin mejora', summary.epochs_without_improvement], ['Paciencia restante', summary.patience_remaining]
       ].map(([label, value]) => `<tr><td>${{label}}</td><td>${{value ?? ''}}</td></tr>`).join('') : `<tr><td colspan='2' class='empty'>Sin información guardada.</td></tr>`;
