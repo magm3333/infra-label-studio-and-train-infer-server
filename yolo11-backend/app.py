@@ -619,35 +619,6 @@ def chart_points(rows, key, width=560, height=180, pad=26):
     return " ".join(points), min_value, max_value
 
 
-def svg_chart(rows, key, title, color):
-    points, min_value, max_value = chart_points(rows, key)
-    if not points:
-        return f"<div class='chart empty'>Sin datos para {html.escape(title)}</div>"
-    latest = metric_float(rows[-1], key)
-    help_text = chart_help_text(key)
-    return f"""
-    <div class='chart'>
-      <div class='chart-head'><strong>{html.escape(title)} <span class='help' data-tip='{html.escape(help_text)}'>?</span></strong><span>último: {latest:.4f}</span></div>
-      <svg viewBox='0 0 560 180' role='img'>
-        <line x1='26' y1='154' x2='534' y2='154' class='axis'/>
-        <line x1='26' y1='26' x2='26' y2='154' class='axis'/>
-        <polyline points='{points}' fill='none' stroke='{color}' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/>
-      </svg>
-      <div class='chart-scale'><span>min {min_value:.4f}</span><span>max {max_value:.4f}</span></div>
-    </div>
-    """
-
-
-def chart_help_text(key):
-    texts = {
-        "metrics/mAP50-95(B)": "mAP50-95\nMide la calidad promedio de detección con criterios estrictos de solapamiento.\nMás alto es mejor.\n0.50 es aceptable, 0.70+ suele ser bueno, 0.90+ es excelente si el dataset es representativo.",
-        "metrics/mAP50(B)": "mAP50\nMide detecciones correctas con un criterio de solapamiento más permisivo.\nMás alto es mejor.\nSirve para ver si el modelo encuentra los objetos, pero puede ser optimista frente a mAP50-95.",
-        "train/box_loss": "Train box loss\nError de localización de cajas en el conjunto de entrenamiento.\nMás bajo es mejor.\nDebe tender a bajar; si baja mucho y la validación empeora puede haber sobreajuste.",
-        "val/box_loss": "Val box loss\nError de localización de cajas en validación.\nMás bajo es mejor.\nEs más importante que train loss para saber si generaliza. Si sube mientras train baja, puede haber sobreajuste.",
-    }
-    return texts.get(key, "Métrica de entrenamiento YOLO. Revisa si mejora de forma estable durante las épocas.")
-
-
 load_jobs()
 
 
