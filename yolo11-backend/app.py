@@ -1577,13 +1577,18 @@ def index():
                       Best ep.{{{{ job.metrics.summary.best_epoch }}}} · mAP {{{{ Number(job.metrics.summary.best_metric).toFixed(4) }}}}
                     </v-list-item-subtitle>
                     <template v-slot:append>
-                      <v-btn
-                        icon size="x-small" variant="text" color="error"
-                        :disabled="job.status === 'running'"
-                        @click.stop="deleteJob(job.id)"
-                      >
-                        <v-icon size="16">mdi-delete-outline</v-icon>
-                      </v-btn>
+                      <v-tooltip text="Eliminar job" location="top">
+                        <template v-slot:activator="{ props }">
+                          <v-btn
+                            v-bind="props"
+                            icon size="x-small" variant="text" color="error"
+                            :disabled="job.status === 'running'"
+                            @click.stop="deleteJob(job.id)"
+                          >
+                            <v-icon size="16">mdi-delete-outline</v-icon>
+                          </v-btn>
+                        </template>
+                      </v-tooltip>
                     </template>
                   </v-list-item>
                 </v-list>
@@ -1774,18 +1779,28 @@ def index():
                       <td class="text-caption">{{{{ m.project }}}}</td>
                       <td class="text-caption">{{{{ m.modifiedLabel }}}}</td>
                       <td>
-                        <v-btn
-                          icon size="x-small" variant="text"
-                          :href="'/download/models/' + m.name" target="_blank"
-                        >
-                          <v-icon size="16">mdi-download</v-icon>
-                        </v-btn>
-                        <v-btn
-                          icon size="x-small" variant="text" color="primary"
-                          @click="useForInference(m.path)"
-                        >
-                          <v-icon size="16">mdi-play</v-icon>
-                        </v-btn>
+                        <v-tooltip text="Descargar modelo (.pt)" location="top">
+                          <template v-slot:activator="{ props }">
+                            <v-btn
+                              v-bind="props"
+                              icon size="x-small" variant="text"
+                              :href="'/download/models/' + m.name" target="_blank"
+                            >
+                              <v-icon size="16">mdi-download</v-icon>
+                            </v-btn>
+                          </template>
+                        </v-tooltip>
+                        <v-tooltip text="Activar para inferencia y cambiar al tab Inferencia" location="top">
+                          <template v-slot:activator="{ props }">
+                            <v-btn
+                              v-bind="props"
+                              icon size="x-small" variant="text" color="primary"
+                              @click="useForInference(m.path)"
+                            >
+                              <v-icon size="16">mdi-play</v-icon>
+                            </v-btn>
+                          </template>
+                        </v-tooltip>
                       </td>
                     </tr>
                   </tbody>
