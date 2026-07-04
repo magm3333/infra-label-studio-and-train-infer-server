@@ -1242,9 +1242,299 @@ def index():
 
           <!-- ═════════════════ TAB: ENTRENAR ═════════════════ -->
           <v-tabs-window-item value="entrenar">
-            <v-alert type="info" variant="tonal">
-              Tab Entrenar — próxima fase
-            </v-alert>
+            <v-row>
+
+              <!-- Formulario de entrenamiento -->
+              <v-col cols="12" md="6">
+                <v-card variant="outlined" class="mb-4">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2" color="primary">mdi-cog</v-icon>
+                    Configuración de entrenamiento
+                  </v-card-title>
+                  <v-card-text>
+                    <v-alert v-if="trainProjects.length === 0" type="warning" variant="tonal" density="compact" class="mb-4">
+                      No se pudieron cargar proyectos desde Label Studio. Revisá conectividad y API key.
+                    </v-alert>
+
+                    <v-row dense>
+                      <v-col cols="12">
+                        <field-label
+                          label="Proyecto Label Studio"
+                          tooltip="Proyecto del que se exportan las anotaciones para construir el dataset de entrenamiento. Debe tener tareas con bounding boxes correctamente anotadas."
+                        ></field-label>
+                        <v-select
+                          v-model="trainForm.project"
+                          :items="trainProjects"
+                          item-title="label"
+                          item-value="id"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-select>
+                      </v-col>
+                      <v-col cols="12">
+                        <field-label
+                          label="Modelo base"
+                          tooltip="Modelo YOLO preentrenado desde el que se inicia el fine-tuning. Modelos más grandes (m, l, x) son más lentos pero potencialmente más precisos. Elegí el mismo tamaño que el modelo en producción para que los pesos sean compatibles."
+                        ></field-label>
+                        <v-select
+                          v-model="trainForm.model_path"
+                          :items="trainModels"
+                          item-title="label"
+                          item-value="path"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-select>
+                      </v-col>
+                      <v-col cols="12" sm="6">
+                        <field-label
+                          label="Device"
+                          tooltip="Dispositivo de cómputo para el entrenamiento.&#10;&#10;auto: selecciona GPU CUDA si está disponible, sino CPU.&#10;cpu: sin GPU, mucho más lento (puede ser 10-50× más lento que GPU).&#10;0, 1, ...: índice de GPU específica si hay varias instaladas."
+                        ></field-label>
+                        <v-select
+                          v-model="trainForm.device"
+                          :items="trainDevices"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-select>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Epochs"
+                          tooltip="Número máximo de pasadas completas sobre el dataset. YOLO suele converger en 50-300 epochs según el dataset. El early stopping (patience) puede detenerlo antes si deja de mejorar."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.epochs"
+                          type="number"
+                          min="1"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Patience"
+                          tooltip="Early stopping: epochs consecutivos sin mejora en mAP50-95 antes de detener automáticamente.&#10;&#10;0 = desactivado (entrena hasta el máximo de epochs).&#10;20 es el default. Para datasets pequeños se puede subir a 50."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.patience"
+                          type="number"
+                          min="0"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Image size"
+                          tooltip="Tamaño (en píxeles) al que se redimensionan las imágenes para entrenamiento e inferencia. Debe ser múltiplo de 32.&#10;&#10;640: default, buen balance velocidad/precisión.&#10;1280: más preciso en objetos pequeños, pero usa el doble de VRAM.&#10;Debe coincidir con el tamaño usado en inferencia."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.imgsz"
+                          type="number"
+                          min="32"
+                          step="32"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Batch"
+                          tooltip="Imágenes procesadas en paralelo por paso de gradiente. Más grande = gradiente más estable y entrenamiento más rápido, pero más VRAM.&#10;&#10;Si aparece 'CUDA out of memory', reducir a la mitad.&#10;-1: auto (YOLO elige según VRAM disponible)."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.batch"
+                          type="number"
+                          min="1"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Workers"
+                          tooltip="Procesos paralelos del DataLoader para cargar imágenes desde disco. Más workers = carga más rápida si el disco es el cuello de botella.&#10;&#10;Usá 0 si el entrenamiento falla al iniciar — algunos entornos Docker no soportan multiprocessing con fork."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.workers"
+                          type="number"
+                          min="0"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="LR inicial (lr0)"
+                          tooltip="Learning rate inicial del optimizador SGD. YOLO aplica warmup lineal en las primeras epochs y luego decaimiento cosine hasta lr_f.&#10;&#10;0.01: default para fine-tuning desde cero.&#10;Demasiado alto: entrenamiento inestable (loss diverge).&#10;Demasiado bajo: convergencia muy lenta."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.lr0"
+                          type="number"
+                          min="0"
+                          step="0.0001"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Weight decay"
+                          tooltip="Regularización L2 del optimizador: penaliza pesos grandes para reducir sobreajuste.&#10;&#10;0.0005: default de YOLO, funciona bien en la mayoría de casos.&#10;Aumentarlo (0.001) si el modelo sobreajusta.&#10;Reducirlo (0.00001) si el dataset es muy pequeño."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.weight_decay"
+                          type="number"
+                          min="0"
+                          step="0.00001"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Cosine LR"
+                          tooltip="Activa el scheduler cosine annealing: el learning rate decae siguiendo una curva coseno desde lr0 hasta lr_f.&#10;&#10;Recomendado para entrenamientos largos (>100 epochs). Produce convergencia más suave que el decay lineal."
+                        ></field-label>
+                        <v-select
+                          v-model="trainForm.cos_lr"
+                          :items="[{{title:'No',value:false}},{{title:'Sí',value:true}}]"
+                          item-title="title"
+                          item-value="value"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-select>
+                      </v-col>
+                      <v-col cols="12">
+                        <field-label
+                          label="Train split"
+                          tooltip="Porcentaje de imágenes del proyecto que se usan para entrenamiento. El resto se reserva para validación.&#10;&#10;80/20: default recomendado con datasets medianos (>500 imágenes).&#10;Con datasets muy pequeños (<200) puede subirse a 90/10, aunque la señal de validación será más ruidosa."
+                        ></field-label>
+                        <div class="text-caption text-medium-emphasis mb-1">
+                          <strong>{{{{ trainForm.train_percent }}}}%</strong> train /
+                          <strong>{{{{ 100 - trainForm.train_percent }}}}%</strong> valid
+                        </div>
+                        <v-slider
+                          v-model="trainForm.train_percent"
+                          min="1" max="99" step="1"
+                          color="primary"
+                          thumb-label
+                          density="compact"
+                          hide-details
+                        ></v-slider>
+                      </v-col>
+                    </v-row>
+
+                    <!-- Upload modelo externo -->
+                    <v-divider class="my-3"></v-divider>
+                    <div class="text-caption text-medium-emphasis mb-2">Modelo externo (.pt)</div>
+                    <div class="d-flex align-center ga-2">
+                      <v-file-input
+                        v-model="externalModelFile"
+                        label="Subir .pt como modelo base"
+                        accept=".pt"
+                        variant="outlined"
+                        density="compact"
+                        prepend-icon=""
+                        hide-details
+                        style="flex:1"
+                      ></v-file-input>
+                      <v-btn
+                        variant="outlined"
+                        :loading="uploadingModel"
+                        :disabled="!externalModelFile || !externalModelFile.length"
+                        @click="uploadExternalModel"
+                        size="small"
+                      >Subir</v-btn>
+                    </div>
+                    <div v-if="uploadMsg" class="text-caption mt-1" :class="uploadOk ? 'text-success' : 'text-error'">
+                      {{{{ uploadMsg }}}}
+                    </div>
+
+                    <v-divider class="my-4"></v-divider>
+                    <v-btn
+                      color="primary"
+                      variant="flat"
+                      :loading="startingTrain"
+                      :disabled="isRunning || !trainForm.project"
+                      @click="startTraining"
+                      prepend-icon="mdi-play"
+                      block
+                    >Iniciar entrenamiento</v-btn>
+                    <div v-if="startTrainMsg" class="text-caption mt-2" :class="startTrainOk ? 'text-success' : 'text-error'">
+                      {{{{ startTrainMsg }}}}
+                    </div>
+                  </v-card-text>
+                </v-card>
+              </v-col>
+
+              <!-- Card progreso live (solo si hay job running/queued) -->
+              <v-col cols="12" md="6">
+                <v-card v-if="runningJob" variant="outlined" color="warning" class="mb-4">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2 mdi-spin" color="warning">mdi-loading</v-icon>
+                    Entrenamiento en curso
+                  </v-card-title>
+                  <v-card-text>
+                    <div class="text-caption text-medium-emphasis mb-1">
+                      Proyecto {{{{ runningJob.project }}}}
+                    </div>
+                    <div class="d-flex align-center justify-space-between mb-1">
+                      <span class="text-body-2">
+                        Época {{{{ runningJob.progress && runningJob.progress.current_epoch || 0 }}}}
+                        / {{{{ runningJob.progress && runningJob.progress.total_epochs || '—' }}}}
+                      </span>
+                      <span class="text-caption text-medium-emphasis">{{{{ fmtDuration(runningJob.elapsed_seconds) }}}}</span>
+                    </div>
+                    <v-progress-linear
+                      :model-value="epochPct(runningJob)"
+                      color="warning"
+                      height="8"
+                      rounded
+                      class="mb-3"
+                    ></v-progress-linear>
+
+                    <div class="d-flex ga-2 flex-wrap mb-3">
+                      <v-chip color="success" size="small" variant="tonal">
+                        Best epoch: {{{{ runningJob.metrics && runningJob.metrics.summary && runningJob.metrics.summary.best_epoch !== null ? runningJob.metrics.summary.best_epoch : '—' }}}}
+                      </v-chip>
+                      <v-chip color="primary" size="small" variant="tonal">
+                        mAP50-95: {{{{ runningJob.metrics && runningJob.metrics.summary && runningJob.metrics.summary.best_metric !== null ? Number(runningJob.metrics.summary.best_metric).toFixed(4) : '—' }}}}
+                      </v-chip>
+                      <v-chip size="small" variant="tonal">
+                        {{{{ runningJob.phase || runningJob.status }}}}
+                      </v-chip>
+                    </div>
+
+                    <div class="text-caption text-medium-emphasis mb-4">{{{{ runningJob.message }}}}</div>
+
+                    <v-btn
+                      color="error"
+                      variant="outlined"
+                      size="small"
+                      @click="cancelJob(runningJob.id)"
+                      prepend-icon="mdi-stop"
+                    >Cancelar entrenamiento</v-btn>
+                  </v-card-text>
+                </v-card>
+
+                <v-alert v-else type="info" variant="tonal">
+                  Sin entrenamiento activo. Completá el formulario y hacé clic en "Iniciar entrenamiento".
+                </v-alert>
+              </v-col>
+
+            </v-row>
           </v-tabs-window-item>
 
           <!-- ═════════════════ TAB: HISTORIAL ═════════════════ -->
@@ -1313,6 +1603,23 @@ def index():
 const {{ createApp, ref, computed, onMounted, onUnmounted }} = Vue;
 const {{ createVuetify }} = Vuetify;
 
+// Componente reutilizable: label + tooltip de ayuda (igual que lpr-ocr-labeler)
+const FieldLabel = {{
+  props: {{ label: String, tooltip: String }},
+  template: `
+    <div class="d-flex align-center mb-1">
+      <span style="font-size:12px;font-weight:600;color:rgba(255,255,255,.6)">{{{{ label }}}}</span>
+      <v-tooltip v-if="tooltip" :text="tooltip" location="top end" max-width="320" open-delay="150">
+        <template v-slot:activator="{{ props }}">
+          <v-icon v-bind="props" size="14" color="grey-darken-1" style="margin-left:4px;cursor:help">
+            mdi-information-outline
+          </v-icon>
+        </template>
+      </v-tooltip>
+    </div>
+  `,
+}};
+
 const vuetify = createVuetify({{
   theme: {{
     defaultTheme: 'dark',
@@ -1341,6 +1648,37 @@ createApp({{
     const selectedJob = ref(null);
     const activeModelName = ref(INITIAL_DATA.currentModelName || '');
 
+    // ── Entrenar ──
+    const trainForm = ref({{
+      project: null,
+      model_path: '',
+      device: INITIAL_DATA.defaults.device || 'auto',
+      epochs: INITIAL_DATA.defaults.epochs,
+      imgsz: INITIAL_DATA.defaults.imgsz,
+      batch: INITIAL_DATA.defaults.batch,
+      patience: INITIAL_DATA.defaults.patience,
+      workers: INITIAL_DATA.defaults.workers,
+      lr0: INITIAL_DATA.defaults.lr0,
+      weight_decay: INITIAL_DATA.defaults.weightDecay,
+      cos_lr: INITIAL_DATA.defaults.cosLr,
+      train_percent: INITIAL_DATA.defaults.splitPercent,
+    }});
+    const trainProjects = ref(
+      (INITIAL_DATA.projects || []).map(p => ({{ id: p.id, label: p.id + ' — ' + p.title }}))
+    );
+    const trainDevices = ref(
+      ['auto', 'cpu'].concat((INITIAL_DATA.devices || []).map((name, i) => ({{ title: i + ' — ' + name, value: String(i) }})))
+    );
+    const trainModels = ref([]);
+    const externalModelFile = ref(null);
+    const uploadingModel = ref(false);
+    const uploadMsg = ref('');
+    const uploadOk = ref(true);
+    const startingTrain = ref(false);
+    const startTrainMsg = ref('');
+    const startTrainOk = ref(true);
+    const runningJob = computed(() => jobs.value.find(j => j.status === 'running' || j.status === 'queued') || null);
+
     // ── Inferencia ──
     const availableModels = ref([]);
     const inferenceModelPath = ref(INITIAL_DATA.currentModelPath || '');
@@ -1368,6 +1706,93 @@ createApp({{
       return (h ? h + 'h ' : '') + (h || m ? m + 'm ' : '') + s + 's';
     }}
 
+    function epochPct(job) {{
+      if (!job || !job.progress) return 0;
+      const {{ current_epoch, total_epochs }} = job.progress;
+      if (!total_epochs) return 0;
+      return Math.round((current_epoch / total_epochs) * 100);
+    }}
+
+    async function uploadExternalModel() {{
+      if (!externalModelFile.value || !externalModelFile.value.length) return;
+      uploadingModel.value = true; uploadMsg.value = '';
+      try {{
+        const fd = new FormData();
+        fd.append('model', externalModelFile.value[0]);
+        const res = await fetch('/api/external-models', {{ method: 'POST', body: fd }});
+        const data = await res.json().catch(() => ({{}}));
+        if (res.ok) {{
+          uploadMsg.value = 'Modelo subido: ' + data.model.name;
+          uploadOk.value = true;
+          trainForm.value.model_path = data.model.path;
+          await fetchModels();
+        }} else {{
+          uploadMsg.value = 'Error: ' + (data.message || JSON.stringify(data));
+          uploadOk.value = false;
+        }}
+      }} catch (e) {{
+        uploadMsg.value = 'Error de red: ' + e.message;
+        uploadOk.value = false;
+      }} finally {{
+        uploadingModel.value = false;
+      }}
+    }}
+
+    async function startTraining() {{
+      startingTrain.value = true; startTrainMsg.value = '';
+      try {{
+        const payload = {{
+          project: Number(trainForm.value.project),
+          model_path: trainForm.value.model_path,
+          device: trainForm.value.device,
+          epochs: Number(trainForm.value.epochs),
+          imgsz: Number(trainForm.value.imgsz),
+          batch: Number(trainForm.value.batch),
+          patience: Number(trainForm.value.patience),
+          workers: Number(trainForm.value.workers),
+          lr0: Number(trainForm.value.lr0),
+          weight_decay: Number(trainForm.value.weight_decay),
+          cos_lr: Boolean(trainForm.value.cos_lr),
+          train_percent: Number(trainForm.value.train_percent),
+        }};
+        const res = await fetch('/train', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload),
+        }});
+        const data = await res.json();
+        if (res.ok && data.status !== 'busy') {{
+          startTrainMsg.value = 'Job iniciado: ' + data.job_id;
+          startTrainOk.value = true;
+          await fetchJobs();
+        }} else if (data.status === 'busy') {{
+          startTrainMsg.value = 'Ya hay un entrenamiento corriendo.';
+          startTrainOk.value = false;
+        }} else {{
+          startTrainMsg.value = 'Error: ' + (data.message || JSON.stringify(data));
+          startTrainOk.value = false;
+        }}
+      }} catch (e) {{
+        startTrainMsg.value = 'Error de red: ' + e.message;
+        startTrainOk.value = false;
+      }} finally {{
+        startingTrain.value = false;
+      }}
+    }}
+
+    async function cancelJob(jobId) {{
+      const res = await fetch('/api/jobs/' + jobId + '/cancel', {{ method: 'POST' }});
+      const data = await res.json().catch(() => ({{}}));
+      if (res.ok) {{
+        startTrainMsg.value = 'Entrenamiento cancelado. El backend se reiniciará.';
+        startTrainOk.value = true;
+        setTimeout(fetchJobs, 2500);
+      }} else {{
+        startTrainMsg.value = 'Error al cancelar: ' + (data.message || '');
+        startTrainOk.value = false;
+      }}
+    }}
+
     async function fetchModels() {{
       try {{
         const res = await fetch('/api/models');
@@ -1377,10 +1802,15 @@ createApp({{
           ...m,
           label: m.name + (m.source === 'entrenado' && m.project ? ' [proy ' + m.project + ']' : '') + (m.active ? ' ✓' : ''),
         }}));
+        trainModels.value = opts.map(m => ({{
+          path: m.path,
+          label: m.name + (m.source === 'entrenado' && m.project ? ' [proy ' + m.project + ']' : ''),
+        }}));
         const active = opts.find(m => m.active);
         if (active) {{
           activeModelName.value = active.name;
           inferenceModelPath.value = active.path;
+          if (!trainForm.value.model_path) trainForm.value.model_path = active.path;
         }}
       }} catch (e) {{
         console.warn('Error fetching models', e);
@@ -1465,9 +1895,13 @@ createApp({{
       availableModels, inferenceModelPath, activeLabels,
       confidence, ultralytics, applyingModel, inferenceMsg, inferenceMsgType,
       applyInferenceModel,
+      trainForm, trainProjects, trainDevices, trainModels,
+      externalModelFile, uploadingModel, uploadMsg, uploadOk,
+      startingTrain, startTrainMsg, startTrainOk, runningJob,
+      epochPct, uploadExternalModel, startTraining, cancelJob,
     }};
   }},
-}}).use(vuetify).mount('#app');
+}}).use(vuetify).component('field-label', FieldLabel).mount('#app');
 </script>
 </body>
 </html>"""
