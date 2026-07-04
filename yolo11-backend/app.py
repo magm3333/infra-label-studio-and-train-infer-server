@@ -1059,6 +1059,10 @@ def index():
     .chart-wrap svg {{ width: 100%; height: 180px; display: block; }}
     .axis {{ stroke: #2b3958; stroke-width: 1; }}
     .v-application {{ background: #121212 !important; }}
+    .nv-table {{ width: 100%; border-collapse: collapse; }}
+    .nv-table th {{ text-align: left; font-size: 11px; font-weight: 600; color: rgba(255,255,255,.5); padding: 6px 16px; border-bottom: 1px solid rgba(255,255,255,.12); }}
+    .nv-table td {{ font-size: 12px; padding: 6px 16px; border-bottom: 1px solid rgba(255,255,255,.06); vertical-align: middle; }}
+    .nv-table tbody tr:hover {{ background: rgba(255,255,255,.03); }}
   </style>
 </head>
 <body>
@@ -1179,7 +1183,7 @@ def index():
                     Conexión Label Studio
                   </v-card-title>
                   <v-card-text>
-                    <v-table density="compact">
+                    <table style="width:100%;border-collapse:collapse" class="nv-table">
                       <tbody>
                         <tr>
                           <td class="text-caption text-medium-emphasis" style="width:110px">Predicción</td>
@@ -1202,7 +1206,7 @@ def index():
                           <td class="text-caption">{{{{ ultralytics }}}}</td>
                         </tr>
                       </tbody>
-                    </v-table>
+                    </table>
                   </v-card-text>
                 </v-card>
 
@@ -1616,7 +1620,7 @@ def index():
                       </div>
                     </v-card-title>
                     <v-card-text class="pa-0">
-                      <v-table density="compact">
+                      <table style="width:100%;border-collapse:collapse" class="nv-table">
                         <tbody>
                           <tr>
                             <td class="text-caption text-medium-emphasis" style="width:140px;padding:6px 16px">Status</td>
@@ -1671,7 +1675,7 @@ def index():
                             <td class="text-caption text-error" style="padding:6px 16px">{{{{ selectedJob.error }}}}</td>
                           </tr>
                         </tbody>
-                      </v-table>
+                      </table>
                     </v-card-text>
                   </v-card>
 
@@ -1748,7 +1752,7 @@ def index():
                 Modelos entrenados ({{{{ modelsTable.length }}}})
               </v-card-title>
               <v-card-text class="pa-0">
-                <v-table density="compact">
+                <table style="width:100%;border-collapse:collapse" class="nv-table">
                   <thead>
                     <tr>
                       <th class="text-caption">Nombre</th>
@@ -1785,7 +1789,7 @@ def index():
                       </td>
                     </tr>
                   </tbody>
-                </v-table>
+                </table>
               </v-card-text>
             </v-card>
 
@@ -2029,13 +2033,16 @@ createApp({{
           inferenceModelPath.value = active.path;
           if (!trainForm.value.model_path) trainForm.value.model_path = active.path;
         }}
-        modelsTable.value = (data.models || []).map(m => ({{
-          ...m,
-          map5095: (m.metadata && m.metadata.map5095 != null) ? Number(m.metadata.map5095).toFixed(4) : '—',
-          project: (m.metadata && m.metadata.project) ? m.metadata.project : '—',
-          modifiedLabel: m.modified_at ? new Date(m.modified_at * 1000).toLocaleDateString('es-AR') : '—',
-          sizeLabel: fmtSize(m.size),
-        }}));
+        modelsTable.value = (data.models || []).map(m => {{
+          const lat = (m.metadata && m.metadata.metrics && m.metadata.metrics.latest) || {{}};
+          return {{
+            ...m,
+            map5095: lat['metrics/mAP50-95(B)'] != null ? Number(lat['metrics/mAP50-95(B)']).toFixed(4) : '—',
+            project: (m.metadata && m.metadata.dataset && m.metadata.dataset.project) || '—',
+            modifiedLabel: m.modified_at ? new Date(m.modified_at * 1000).toLocaleDateString('es-AR') : '—',
+            sizeLabel: fmtSize(m.size),
+          }};
+        }});
       }} catch (e) {{
         console.warn('Error fetching models', e);
       }}
