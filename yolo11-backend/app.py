@@ -1578,7 +1578,7 @@ def index():
                     </v-list-item-subtitle>
                     <template v-slot:append>
                       <v-tooltip text="Eliminar job" location="top">
-                        <template v-slot:activator="{ props }">
+                        <template v-slot:activator="{{ props }}">
                           <v-btn
                             v-bind="props"
                             icon size="x-small" variant="text" color="error"
@@ -1780,7 +1780,7 @@ def index():
                       <td class="text-caption">{{{{ m.modifiedLabel }}}}</td>
                       <td>
                         <v-tooltip text="Descargar modelo (.pt)" location="top">
-                          <template v-slot:activator="{ props }">
+                          <template v-slot:activator="{{ props }}">
                             <v-btn
                               v-bind="props"
                               icon size="x-small" variant="text"
@@ -1791,7 +1791,7 @@ def index():
                           </template>
                         </v-tooltip>
                         <v-tooltip text="Activar para inferencia y cambiar al tab Inferencia" location="top">
-                          <template v-slot:activator="{ props }">
+                          <template v-slot:activator="{{ props }}">
                             <v-btn
                               v-bind="props"
                               icon size="x-small" variant="text" color="primary"
