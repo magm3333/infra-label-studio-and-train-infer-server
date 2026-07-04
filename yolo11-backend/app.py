@@ -1740,6 +1740,55 @@ def index():
                 </div>
               </v-col>
             </v-row>
+
+            <!-- Tabla de modelos entrenados -->
+            <v-card v-if="modelsTable.length" variant="outlined" class="mt-4">
+              <v-card-title class="text-body-2 font-weight-bold pt-3 pb-1">
+                <v-icon size="16" class="mr-1" color="primary">mdi-file-cog-outline</v-icon>
+                Modelos entrenados ({{{{ modelsTable.length }}}})
+              </v-card-title>
+              <v-card-text class="pa-0">
+                <v-table density="compact">
+                  <thead>
+                    <tr>
+                      <th class="text-caption">Nombre</th>
+                      <th class="text-caption">Tamaño</th>
+                      <th class="text-caption">mAP50-95</th>
+                      <th class="text-caption">Proyecto</th>
+                      <th class="text-caption">Fecha</th>
+                      <th class="text-caption">Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="m in modelsTable" :key="m.path">
+                      <td class="text-caption">
+                        <v-chip v-if="m.active" color="success" size="x-small" variant="flat" class="mr-1">activo</v-chip>
+                        {{{{ m.name }}}}
+                      </td>
+                      <td class="text-caption">{{{{ m.sizeLabel }}}}</td>
+                      <td class="text-caption">{{{{ m.map5095 }}}}</td>
+                      <td class="text-caption">{{{{ m.project }}}}</td>
+                      <td class="text-caption">{{{{ m.modifiedLabel }}}}</td>
+                      <td>
+                        <v-btn
+                          icon size="x-small" variant="text"
+                          :href="'/download/models/' + m.name" target="_blank"
+                        >
+                          <v-icon size="16">mdi-download</v-icon>
+                        </v-btn>
+                        <v-btn
+                          icon size="x-small" variant="text" color="primary"
+                          @click="useForInference(m.path)"
+                        >
+                          <v-icon size="16">mdi-play</v-icon>
+                        </v-btn>
+                      </td>
+                    </tr>
+                  </tbody>
+                </v-table>
+              </v-card-text>
+            </v-card>
+
           </v-tabs-window-item>
 
         </v-tabs-window>
@@ -1837,6 +1886,7 @@ createApp({{
       ['auto', 'cpu'].concat((INITIAL_DATA.devices || []).map((name, i) => ({{ title: i + ' — ' + name, value: String(i) }})))
     );
     const trainModels = ref([]);
+    const modelsTable = ref([]);
     const externalModelFile = ref(null);
     const uploadingModel = ref(false);
     const uploadMsg = ref('');
@@ -1979,6 +2029,13 @@ createApp({{
           inferenceModelPath.value = active.path;
           if (!trainForm.value.model_path) trainForm.value.model_path = active.path;
         }}
+        modelsTable.value = (data.models || []).map(m => ({{
+          ...m,
+          map5095: (m.metadata && m.metadata.map5095 != null) ? Number(m.metadata.map5095).toFixed(4) : '—',
+          project: (m.metadata && m.metadata.project) ? m.metadata.project : '—',
+          modifiedLabel: m.modified_at ? new Date(m.modified_at * 1000).toLocaleDateString('es-AR') : '—',
+          sizeLabel: fmtSize(m.size),
+        }}));
       }} catch (e) {{
         console.warn('Error fetching models', e);
       }}
@@ -2043,6 +2100,13 @@ createApp({{
       }} catch (e) {{
         selectedJob.value = job;
       }}
+    }}
+
+    function fmtSize(bytes) {{
+      if (!bytes) return '—';
+      if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+      if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return bytes + ' B';
     }}
 
     function fmtDate(ts) {{
@@ -2167,6 +2231,7 @@ createApp({{
       epochPct, uploadExternalModel, startTraining, cancelJob,
       deleteJob, useForInference, patiencePct, patienceColor,
       metricLabels, chartsHtml,
+      modelsTable, fmtSize,
     }};
   }},
 }}).use(vuetify).component('field-label', FieldLabel).mount('#app');
