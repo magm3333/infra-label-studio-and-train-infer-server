@@ -137,8 +137,7 @@ def parse_label_config(label_config):
         state["to_name"] = rect_match.group(2)
     if image_match:
         state["value"] = image_match.group(1)
-    if labels:
-        state["labels"] = labels
+    state["labels"] = labels  # Vacío = sin filtro de clases en predict
 
 
 def resolve_image_path(image_value):
@@ -336,7 +335,8 @@ def label_studio_projects():
             if project_id is None:
                 continue
             title = item.get("title") or item.get("name") or f"Proyecto {project_id}"
-            projects.append({"id": project_id, "title": str(title)})
+            task_count = item.get("task_number") or item.get("num_tasks") or item.get("task_count") or 0
+            projects.append({"id": project_id, "title": str(title), "task_count": task_count})
         return sorted(projects, key=lambda item: str(item["title"]).lower())
     except Exception as exc:
         app.logger.warning("Could not load Label Studio projects: %s", exc)
@@ -617,35 +617,6 @@ def chart_points(rows, key, width=560, height=180, pad=26):
         y = height - pad - ((value - min_value) / span) * (height - pad * 2)
         points.append(f"{x:.1f},{y:.1f}")
     return " ".join(points), min_value, max_value
-
-
-def svg_chart(rows, key, title, color):
-    points, min_value, max_value = chart_points(rows, key)
-    if not points:
-        return f"<div class='chart empty'>Sin datos para {html.escape(title)}</div>"
-    latest = metric_float(rows[-1], key)
-    help_text = chart_help_text(key)
-    return f"""
-    <div class='chart'>
-      <div class='chart-head'><strong>{html.escape(title)} <span class='help' data-tip='{html.escape(help_text)}'>?</span></strong><span>último: {latest:.4f}</span></div>
-      <svg viewBox='0 0 560 180' role='img'>
-        <line x1='26' y1='154' x2='534' y2='154' class='axis'/>
-        <line x1='26' y1='26' x2='26' y2='154' class='axis'/>
-        <polyline points='{points}' fill='none' stroke='{color}' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/>
-      </svg>
-      <div class='chart-scale'><span>min {min_value:.4f}</span><span>max {max_value:.4f}</span></div>
-    </div>
-    """
-
-
-def chart_help_text(key):
-    texts = {
-        "metrics/mAP50-95(B)": "mAP50-95\nMide la calidad promedio de detección con criterios estrictos de solapamiento.\nMás alto es mejor.\n0.50 es aceptable, 0.70+ suele ser bueno, 0.90+ es excelente si el dataset es representativo.",
-        "metrics/mAP50(B)": "mAP50\nMide detecciones correctas con un criterio de solapamiento más permisivo.\nMás alto es mejor.\nSirve para ver si el modelo encuentra los objetos, pero puede ser optimista frente a mAP50-95.",
-        "train/box_loss": "Train box loss\nError de localización de cajas en el conjunto de entrenamiento.\nMás bajo es mejor.\nDebe tender a bajar; si baja mucho y la validación empeora puede haber sobreajuste.",
-        "val/box_loss": "Val box loss\nError de localización de cajas en validación.\nMás bajo es mejor.\nEs más importante que train loss para saber si generaliza. Si sube mientras train baja, puede haber sobreajuste.",
-    }
-    return texts.get(key, "Métrica de entrenamiento YOLO. Revisa si mejora de forma estable durante las épocas.")
 
 
 load_jobs()
@@ -1023,520 +994,1240 @@ def status():
 
 @app.get("/")
 def index():
-    latest_jobs = [public_job(job) for job in sorted(jobs.values(), key=lambda item: item["created_at"], reverse=True)]
-    selected_job = latest_jobs[0] if latest_jobs else None
-    job_cards = "".join(job_card_html(job) for job in latest_jobs) or "<div class='empty'>Todavia no hay jobs de entrenamiento.</div>"
-    model_rows = "".join([
-        f"""
-        <tr>
-          <td>{html.escape(model['name'])}{' <span class="pill">activo</span>' if model['active'] else ''}</td>
-          <td>{model['size'] / 1024 / 1024:.1f} MB</td>
-          <td>{html.escape(model_map5095(model))}</td>
-          <td>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(model['modified_at']))}</td>
-          <td class='row-actions'><button type='button' class='mini' data-model='{html.escape(model['name'])}'>Ver métricas</button><a class='download' href='/download/models/{html.escape(model['name'])}'>Descargar</a></td>
-        </tr>
-        """
-        for model in model_files()
-    ]) or "<tr><td colspan='5' class='empty'>Todavia no hay modelos entrenados.</td></tr>"
-    selected_json = html.escape(json.dumps(selected_job or {}, indent=2, ensure_ascii=False))
-    latest_metrics = (selected_job or {}).get("metrics", {}).get("latest", {}) if selected_job else {}
-    selected_metric_rows = (selected_job or {}).get("metrics", {}).get("rows", []) if selected_job else []
-    selected_summary = (selected_job or {}).get("metrics", {}).get("summary", {}) if selected_job else {}
-    metric_labels = [
-        ("epoch", "Epoch"),
-        ("train/box_loss", "Train box loss"),
-        ("train/cls_loss", "Train cls loss"),
-        ("train/dfl_loss", "Train dfl loss"),
-        ("metrics/precision(B)", "Precision"),
-        ("metrics/recall(B)", "Recall"),
-        ("metrics/mAP50(B)", "mAP50"),
-        ("metrics/mAP50-95(B)", "mAP50-95"),
-        ("val/box_loss", "Val box loss"),
-        ("val/cls_loss", "Val cls loss"),
-        ("val/dfl_loss", "Val dfl loss"),
-        ("lr/pg0", "LR pg0"),
-        ("lr/pg1", "LR pg1"),
-        ("lr/pg2", "LR pg2"),
-    ]
-    metric_rows = "".join(
-        f"<div class='metric-cell {'metric-highlight' if key == 'metrics/mAP50-95(B)' else ''}'><small>{html.escape(label)}</small><strong>{html.escape(str(latest_metrics.get(key, '')))}</strong></div>"
-        for key, label in metric_labels
-    ) if latest_metrics else "<div class='empty'>Sin metricas todavia. Aparecen cuando Ultralytics escribe results.csv.</div>"
-    charts_html = "".join([
-        svg_chart(selected_metric_rows, "metrics/mAP50-95(B)", "mAP50-95", "#70e000"),
-        svg_chart(selected_metric_rows, "metrics/mAP50(B)", "mAP50", "#4cc9f0"),
-        svg_chart(selected_metric_rows, "train/box_loss", "Train box loss", "#ffd166"),
-        svg_chart(selected_metric_rows, "val/box_loss", "Val box loss", "#ff5d73"),
-    ]) if selected_metric_rows else "<div class='empty'>Los gráficos aparecen cuando exista results.csv para el job seleccionado.</div>"
-    best_info_rows = "".join([
-        f"<tr><td>Best existe</td><td>{selected_summary.get('best_exists', False)}</td></tr>",
-        f"<tr><td>Best path</td><td>{html.escape(str(selected_summary.get('best_path', '')))}</td></tr>",
-        f"<tr><td>Best mAP50-95</td><td>{html.escape(str(selected_summary.get('best_metric', '')))}</td></tr>",
-        f"<tr><td>Best epoch</td><td>{html.escape(str(selected_summary.get('best_epoch', '')))}</td></tr>",
-        f"<tr><td>Epoch actual</td><td>{html.escape(str(selected_summary.get('current_epoch', '')))}</td></tr>",
-        f"<tr><td>Epochs sin mejora</td><td>{html.escape(str(selected_summary.get('epochs_without_improvement', '')))}</td></tr>",
-        f"<tr><td>Paciencia restante</td><td>{html.escape(str(selected_summary.get('patience_remaining', '')))}</td></tr>",
-    ]) if selected_summary else "<tr><td colspan='2' class='empty'>Sin información de best/paciencia todavía.</td></tr>"
-    selected_message = html.escape(str((selected_job or {}).get("message", "Selecciona un job para ver su estado.")))
-    selected_phase = html.escape(str((selected_job or {}).get("phase", (selected_job or {}).get("status", "idle"))))
-    selected_dataset = (selected_job or {}).get("dataset") or {}
-    selected_train_images = html.escape(str(selected_dataset.get("train_images", "n/d")))
-    selected_val_images = html.escape(str(selected_dataset.get("val_images", "n/d")))
-    selected_split_value = selected_dataset.get("train_percent")
-    selected_split = html.escape(f"{selected_split_value}%" if selected_split_value is not None else "n/d")
-    initial_selected_job_id = json.dumps((selected_job or {}).get("id"))
-    initial_selected_job_status = json.dumps((selected_job or {}).get("status"))
-    devices = gpu_status().get("cuda_devices", [])
-    device_options = "<option value='auto'>auto</option><option value='cpu'>cpu</option>" + "".join(
-        f"<option value='{index}'>{index} - {html.escape(name)}</option>" for index, name in enumerate(devices)
-    )
-    projects = label_studio_projects()
-    project_options = "".join(
-        f"<option value='{html.escape(str(project['id']))}'>{html.escape(str(project['id']))} - {html.escape(project['title'])}</option>"
-        for project in projects
-    ) or "<option value='' disabled selected>No se pudieron cargar proyectos</option>"
-    project_notice = "" if projects else "<div class='notice'>No se pudieron cargar proyectos desde Label Studio. Revisa conectividad/API key antes de entrenar.</div>"
-    available_options = available_model_options()
-    model_options = "".join(
-        f"<option value='{html.escape(item['path'])}' data-source='{html.escape(item.get('source', ''))}' data-project='{html.escape(str(item.get('project') or ''))}' {'selected' if item['path'] == TRAIN_MODEL_PATH else ''}>{html.escape(model_option_label(item))}</option>"
-        for item in available_options
-    )
-    active_model_options = "".join(
-        f"<option value='{html.escape(item['path'])}' {'selected' if item['active'] else ''}>{html.escape(model_option_label(item))}</option>"
-        for item in available_options
-    )
-    return f"""
-<!doctype html>
-<html lang='es'>
+    initial_data = json.dumps({
+        "projects": label_studio_projects(),
+        "devices": gpu_status().get("cuda_devices", []),
+        "currentModelName": Path(state["model_path"]).name,
+        "currentModelPath": state["model_path"],
+        "confidenceThreshold": CONFIDENCE_THRESHOLD,
+        "ultralytics": ULTRALYTICS_VERSION,
+        "defaults": {
+            "epochs": TRAIN_EPOCHS,
+            "imgsz": TRAIN_IMGSZ,
+            "batch": TRAIN_BATCH,
+            "patience": TRAIN_PATIENCE,
+            "workers": TRAIN_WORKERS,
+            "splitPercent": TRAIN_SPLIT_PERCENT,
+            "lr0": TRAIN_LR0,
+            "weightDecay": TRAIN_WEIGHT_DECAY,
+            "cosLr": TRAIN_COS_LR,
+            "device": TRAIN_DEVICE,
+        },
+    }, ensure_ascii=False)
+
+    return f"""<!doctype html>
+<html lang="es">
 <head>
-  <meta charset='utf-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>YOLO 11 Backend</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YOLO Server &amp; Trainer</title>
+  <link href="https://cdn.jsdelivr.net/npm/vuetify@3/dist/vuetify.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@mdi/font@7/css/materialdesignicons.min.css" rel="stylesheet">
   <style>
-    :root {{ color-scheme: dark; --bg:#0d1321; --panel:#141c2f; --panel2:#19243a; --text:#edf2ff; --muted:#98a6c7; --accent:#70e000; --warn:#ffd166; --bad:#ff5d73; --line:#27344f; }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at top left, #1a2c46, var(--bg) 42%); color:var(--text); }}
-    header {{ padding:32px clamp(18px,4vw,48px) 18px; display:flex; justify-content:space-between; gap:18px; align-items:flex-end; }}
-    h1 {{ margin:0; font-size:clamp(28px,4vw,44px); letter-spacing:-0.04em; }}
-    .subtitle {{ color:var(--muted); margin-top:8px; }}
-    .actions {{ display:flex; gap:10px; flex-wrap:wrap; }}
-    .btn,.download {{ color:#07110b; background:var(--accent); text-decoration:none; border:0; border-radius:999px; padding:10px 14px; font-weight:750; }}
-    main {{ padding:18px clamp(18px,4vw,48px) 42px; display:grid; grid-template-columns: 360px 1fr; gap:18px; }}
-    section {{ background:linear-gradient(180deg,var(--panel),#111827); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow: 0 20px 60px rgba(0,0,0,.28); }}
-    h2 {{ margin:0 0 14px; font-size:18px; }}
-    .metric-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-bottom:18px; }}
-    .metric {{ background:var(--panel2); border:1px solid var(--line); border-radius:16px; padding:14px; }}
-    .metric small {{ color:var(--muted); display:block; margin-bottom:6px; }}
-    .metric strong {{ font-size:18px; overflow-wrap:anywhere; }}
-    .metrics-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }}
-    .metric-cell {{ background:#091120; border:1px solid var(--line); border-radius:14px; padding:12px; min-height:76px; }}
-    .metric-cell small {{ color:var(--muted); display:block; margin-bottom:7px; font-size:12px; }}
-    .metric-cell strong {{ font-size:15px; overflow-wrap:anywhere; }}
-    .metric-highlight {{ background:linear-gradient(135deg,rgba(112,224,0,.28),rgba(76,201,240,.15)); border-color:var(--accent); box-shadow:0 0 0 1px rgba(112,224,0,.25), 0 16px 40px rgba(112,224,0,.14); transform:scale(1.02); }}
-    .metric-highlight small {{ color:#caffbf; }}
-    .metric-highlight strong {{ color:var(--accent); font-size:26px; letter-spacing:-0.03em; }}
-    details {{ border:1px solid var(--line); border-radius:16px; background:#070b13; overflow:hidden; }}
-    summary {{ cursor:pointer; padding:14px 16px; color:var(--text); font-weight:800; }}
-    details pre {{ border:0; border-top:1px solid var(--line); border-radius:0; }}
-    .job-list {{ display:flex; flex-direction:column; gap:10px; }}
-    .job-card {{ width:100%; text-align:left; border:1px solid var(--line); color:var(--text); background:#10192b; border-radius:16px; padding:14px; cursor:pointer; display:grid; gap:6px; }}
-    .job-card:hover {{ border-color:var(--accent); transform:translateY(-1px); }}
-    .status,.pill {{ display:inline-flex; width:max-content; border-radius:999px; padding:4px 9px; background:#24324f; color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; }}
-    .status.running {{ color:#07110b; background:var(--warn); }} .status.completed {{ color:#07110b; background:var(--accent); }} .status.failed {{ color:white; background:var(--bad); }}
-    .duration {{ color:var(--warn); font-weight:800; }}
-    .epoch {{ color:#4cc9f0; font-weight:800; }}
-    .best-epoch {{ color:var(--accent); font-weight:800; }}
-    .row-actions {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
-    .mini {{ color:var(--text); background:#24324f; border:1px solid var(--line); border-radius:999px; padding:9px 12px; cursor:pointer; font-weight:750; }}
-    .delete-job {{ justify-self:start; color:white; background:rgba(255,93,115,.8); border-radius:999px; padding:7px 10px; font-size:12px; font-weight:850; }}
-    .cancel-job {{ justify-self:start; color:#07110b; background:var(--warn); border-radius:999px; padding:7px 10px; font-size:12px; font-weight:850; }}
-    pre {{ margin:0; white-space:pre-wrap; overflow:auto; max-height:520px; background:#070b13; border:1px solid var(--line); border-radius:16px; padding:16px; color:#dce7ff; }}
-    table {{ width:100%; border-collapse:collapse; overflow:hidden; border-radius:16px; }}
-    th,td {{ text-align:left; border-bottom:1px solid var(--line); padding:12px; color:var(--text); }} th {{ color:var(--muted); font-size:12px; text-transform:uppercase; }}
-    .empty {{ color:var(--muted); padding:14px; }}
-    form {{ display:grid; gap:12px; }}
-    .form-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }}
-    label {{ display:grid; gap:6px; color:var(--muted); font-size:13px; font-weight:700; }}
-    input,select {{ width:100%; border:1px solid var(--line); border-radius:12px; background:#090f1d; color:var(--text); padding:11px 12px; font:inherit; }}
-    input[type='file'] {{ padding:9px 10px; }}
-    input[type='range'] {{ padding:0; accent-color:var(--accent); }}
-    input:focus,select:focus {{ outline:2px solid rgba(112,224,0,.35); border-color:var(--accent); }}
-    .notice {{ margin-top:10px; color:var(--muted); min-height:22px; }}
-    .job-message {{ margin-bottom:14px; border:1px solid var(--line); background:#091120; border-radius:16px; padding:14px; display:flex; justify-content:space-between; gap:12px; align-items:center; }}
-    .job-message span {{ color:var(--text); }} .job-message strong {{ color:var(--accent); text-transform:uppercase; font-size:12px; }}
-    .error-box {{ display:none; margin-bottom:14px; border:1px solid rgba(255,93,115,.7); background:rgba(255,93,115,.12); color:#ffd7dd; border-radius:16px; padding:14px; }}
-    .charts {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }}
-    .chart {{ background:#070b13; border:1px solid var(--line); border-radius:16px; padding:12px; min-height:230px; }}
-    .chart-head,.chart-scale {{ display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; }}
-    .chart-head strong {{ color:var(--text); font-size:14px; }}
-    .help {{ position:relative; display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; margin-left:6px; border-radius:50%; background:#24324f; color:var(--accent); font-size:12px; cursor:help; }}
-    .help:hover::after {{ content:attr(data-tip); white-space:pre-line; position:absolute; z-index:20; left:0; top:24px; width:300px; padding:12px; border-radius:12px; background:#050914; color:var(--text); border:1px solid var(--line); box-shadow:0 16px 40px rgba(0,0,0,.45); line-height:1.35; font-weight:500; }}
-    .chart svg {{ width:100%; height:180px; display:block; }}
-    .axis {{ stroke:#2b3958; stroke-width:1; }}
-    @media (max-width: 900px) {{ main {{ grid-template-columns:1fr; }} header {{ align-items:flex-start; flex-direction:column; }} .metric-grid,.metrics-grid {{ grid-template-columns:1fr 1fr; }} }}
-    @media (max-width: 700px) {{ .form-grid,.charts,.metrics-grid {{ grid-template-columns:1fr; }} }}
+    html, body {{ height: 100%; margin: 0; }}
+    .chart-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px; }}
+    .chart-wrap {{ background: #070b13; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 12px; }}
+    .chart-wrap svg {{ width: 100%; height: 180px; display: block; }}
+    .axis {{ stroke: #2b3958; stroke-width: 1; }}
+    .v-application {{ background: #121212 !important; }}
+    .nv-table {{ width: 100%; border-collapse: collapse; }}
+    .nv-table th {{ text-align: left; font-size: 11px; font-weight: 600; color: rgba(255,255,255,.5); padding: 6px 16px; border-bottom: 1px solid rgba(255,255,255,.12); }}
+    .nv-table td {{ font-size: 12px; padding: 6px 16px; border-bottom: 1px solid rgba(255,255,255,.06); vertical-align: middle; }}
+    .nv-table tbody tr:hover {{ background: rgba(255,255,255,.03); }}
   </style>
 </head>
 <body>
-  <header>
-    <div><h1>YOLO 11 Backend</h1><div class='subtitle'>Inferencia, entrenamiento y modelos para Label Studio · Ultralytics {html.escape(ULTRALYTICS_VERSION)}</div></div>
-    <div class='actions'><a class='btn' href='/'>Refrescar</a><a class='btn' href='/status'>JSON status</a></div>
-  </header>
-  <main>
-    <section>
-      <h2>Jobs</h2>
-      <div class='job-list' id='job-list'>{job_cards}</div>
-    </section>
-    <div>
-      <section style='margin-bottom:18px'>
-        <h2>Lanzar entrenamiento</h2>
-        <form id='train-form'>
-          <div class='form-grid'>
-            <label>Proyecto Label Studio<select name='project' required>{project_options}</select></label>
-            <label>Modelo base<select name='model_path'>{model_options}</select></label>
-            <label>Modelo externo <span>Subir .pt para usar como base</span><input id='external-model-file' type='file' accept='.pt'></label>
-            <label>Device<select name='device'>{device_options}</select></label>
-            <label>Epochs<input name='epochs' type='number' min='1' value='{TRAIN_EPOCHS}' required></label>
-            <label>Image size<input name='imgsz' type='number' min='32' step='32' value='{TRAIN_IMGSZ}' required></label>
-            <label>Batch<input name='batch' type='number' min='1' value='{TRAIN_BATCH}' required></label>
-            <label>Patience<input name='patience' type='number' min='0' value='{TRAIN_PATIENCE}' required></label>
-            <label>Workers<input name='workers' type='number' min='0' value='{TRAIN_WORKERS}' required></label>
-            <label>Learning rate lr0<input name='lr0' type='number' min='0' step='0.0001' value='{TRAIN_LR0}' required></label>
-            <label>Weight decay<input name='weight_decay' type='number' min='0' step='0.00001' value='{TRAIN_WEIGHT_DECAY}' required></label>
-            <label>Cosine LR <select name='cos_lr'><option value='false' {'selected' if not TRAIN_COS_LR else ''}>no</option><option value='true' {'selected' if TRAIN_COS_LR else ''}>si</option></select></label>
-            <label>Train split <span><strong id='train-percent-value'>{TRAIN_SPLIT_PERCENT}%</strong> train / <strong id='val-percent-value'>{100 - TRAIN_SPLIT_PERCENT}%</strong> valid</span><input id='train-percent' name='train_percent' type='range' min='1' max='100' value='{TRAIN_SPLIT_PERCENT}' required></label>
-          </div>
-          <button class='mini' type='button' id='upload-external-model'>Subir modelo externo</button>
-          {project_notice}
-          <button class='btn' type='submit'>Iniciar entrenamiento</button>
-          <div id='train-notice' class='notice'></div>
-        </form>
-      </section>
-      <section style='margin-bottom:18px'>
-        <h2>Modelo activo para inferencia</h2>
-        <form id='active-model-form'>
-          <label>Modelo usado por Label Studio para predecir<select name='model_path'>{active_model_options}</select></label>
-          <button class='btn' type='submit'>Usar para inferencia</button>
-          <div id='active-model-notice' class='notice'></div>
-        </form>
-      </section>
-      <section>
-        <h2>Estado</h2>
-        <div class='job-message'><span id='job-message'>{selected_message}</span><strong id='job-phase'>{selected_phase}</strong></div>
-        <div id='job-error' class='error-box'></div>
-        <div class='metric-grid'>
-          <div class='metric'><small>Modelo activo</small><strong>{html.escape(Path(state['model_path']).name)}</strong></div>
-          <div class='metric'><small>Entrenando</small><strong>{'si' if state['training'] else 'no'}</strong></div>
-          <div class='metric'><small>GPU</small><strong>{html.escape(', '.join(gpu_status().get('cuda_devices', [])) or 'sin CUDA')}</strong></div>
-          <div class='metric'><small>Imágenes train</small><strong id='status-train-images'>{selected_train_images}</strong></div>
-          <div class='metric'><small>Imágenes valid</small><strong id='status-val-images'>{selected_val_images}</strong></div>
-          <div class='metric'><small>Split train</small><strong id='status-train-split'>{selected_split}</strong></div>
+<div id="app">
+  <v-app theme="dark">
+
+    <!-- ════════════════════════════════════ APP BAR ════════════════════════════════════ -->
+    <v-app-bar color="surface" elevation="2" height="56">
+      <v-app-bar-title>
+        <div class="d-flex align-center" style="gap:10px">
+          <svg height="20" viewBox="0 0 760 560" xmlns="http://www.w3.org/2000/svg">
+            <defs><style>.r{{fill:#e31e27}}</style></defs>
+            <path class="r" d="m752.23,0v119.81l-40.82-40.82v-27.38c0-7.24-5.87-13.1-13.1-13.1h-27.38L632.42,0h119.81Z"/>
+            <path class="r" d="m682.83,138.25c1.37,0,2.73-.04,2.73-1.59,0-1.27-1.05-1.56-2.16-1.56h-2.05v3.15h1.48Zm-1.48,4.99h-1.12v-9.09h3.48c2.05,0,2.96.89,2.96,2.51s-1.05,2.32-2.28,2.54l2.71,4.03h-1.31l-2.56-4.03h-1.88v4.03Zm-4.9-4.54c0,3.76,2.83,6.74,6.64,6.74s6.64-2.98,6.64-6.74-2.83-6.74-6.64-6.74-6.64,2.98-6.64,6.74m14.49,0c0,4.41-3.42,7.86-7.86,7.86s-7.86-3.44-7.86-7.86,3.42-7.86,7.86-7.86,7.86,3.44,7.86,7.86"/>
+            <path class="r" d="m690.61,67.11l-28.89,79h-13.17l-20.44-56.47-20.28,56.47h-13.17l-28.9-79h14.78l20.27,55.12c.28.77,1.37.76,1.65,0l20.12-55.12h11.37l19.81,55.23c.28.77,1.36.78,1.65,0l20.42-55.24h14.78Z"/>
+            <path class="r" d="m524.92,135.46c-17.06,0-28.52-11.73-28.52-29.19s11.46-28.69,28.52-28.69,28.53,11.53,28.53,28.69-11.46,29.19-28.53,29.19m0-71.31c-25.38,0-43.11,17.32-43.11,42.13s17.73,42.46,43.11,42.46,43.11-17.46,43.11-42.46-17.73-42.13-43.11-42.13"/>
+            <path class="r" d="m456.83,19.74h14.26v126.81h-14.26V19.74Z"/>
+            <path class="r" d="m423.28,50.04v16.64c0,.48.39.88.88.88h21.96v13.27h-21.96c-.48,0-.88.39-.88.88v64.85h-14.26v-64.85c0-.48-.39-.88-.88-.88h-16.54v-13.27h16.54c.48,0,.88-.39.88-.88v-16.81c0-18.31,11.25-30.13,28.66-30.13,2.81,0,5.86.3,9.1.89v12.8c-1.99-.25-6.68-.42-8.77-.42-9.08,0-14.73,6.52-14.73,17.02"/>
+            <path class="r" d="m346.49,136.24c-16.03,0-26.39-11.46-26.39-29.19s10.17-29.18,27.21-29.18c8.18,0,15.26.53,23.99,1.81.43.06.76.44.76.87v46.71c0,.3-.16.59-.41.75-9.09,5.83-16.46,8.23-25.16,8.23m-.66-71.15c-24.12,0-39.82,16.34-39.99,41.63,0,25.29,15.81,42.29,39.33,42.29,9.58,0,17.75-2.4,26.88-7.95v5.48h14.26v-77.08l-1.25-.24c-16.37-3.17-25.53-4.13-39.23-4.13"/>
+            <path class="r" d="m304.92,65.75h1.54v14.09h-1.54c-9.56,0-18.2.24-28.72,1.39-.45.05-.8.43-.8.88v64.45h-14.26v-76.61l1.27-.23c14.75-2.63,29.05-3.97,42.5-3.97"/>
+            <path class="r" d="m231.09,67.56h14.26v77.03l-1.19.28c-10.71,2.52-27.17,4.15-41.92,4.15-20.91,0-32.43-11.58-32.43-32.6v-48.87h14.26v46.73c0,14.36,7.02,21.95,20.31,21.95,8.39,0,17.12-.66,25.96-1.97.43-.06.76-.44.76-.88v-65.84Z"/>
+            <path class="r" d="m159.41,131.44l2.38,12.34-1.31.41c-9.48,2.98-20.54,4.84-28.89,4.84-25.79,0-43.11-17-43.11-42.29s17.72-41.96,44.1-41.96c8.6,0,18.99,1.64,26.46,4.19l1.26.43-2.18,11.97-1.6-.41c-8.48-2.16-16.97-3.4-23.28-3.4-18.43,0-30.33,11.52-30.33,29.35s11.66,29.18,29.02,29.18c6.17,0,15.85-1.58,25.9-4.22l1.59-.42Z"/>
+            <path class="r" d="m39.43,136.24c-16.03,0-26.39-11.46-26.39-29.19s10.17-29.18,27.21-29.18c8.18,0,15.26.53,23.99,1.81.43.06.76.44.76.87v46.71c0,.3-.16.59-.41.75-9.09,5.83-16.46,8.23-25.16,8.23m-.66-71.15C15.87,65.1.17,81.43,0,106.73c0,25.29,15.81,42.29,39.33,42.29,9.58,0,17.75-2.4,26.88-7.95v5.48h14.26v-77.08l-1.25-.24c-16.36-3.17-25.53-4.13-39.23-4.13"/>
+          </svg>
+          <span style="font-size:1rem;font-weight:700;letter-spacing:-.02em">YOLO Server &amp; Trainer</span>
         </div>
-        <details>
-          <summary>Detalle del job seleccionado</summary>
-          <pre id='job-detail'>{selected_json}</pre>
-        </details>
-      </section>
-      <section style='margin-top:18px'>
-        <h2>Métricas YOLO del job</h2>
-        <div class='metrics-grid' id='metrics-body'>{metric_rows}</div>
-      </section>
-      <section style='margin-top:18px'>
-        <h2>Curvas de entrenamiento</h2>
-        <div class='charts' id='charts'>{charts_html}</div>
-      </section>
-      <section style='margin-top:18px'>
-        <h2>Best y paciencia</h2>
-        <table><thead><tr><th>Dato</th><th>Valor</th></tr></thead><tbody id='best-body'>{best_info_rows}</tbody></table>
-      </section>
-      <section style='margin-top:18px'>
-        <h2>Modelos entrenados</h2>
-        <table><thead><tr><th>Modelo</th><th>Tamano</th><th>mAP50-95</th><th>Modificado</th><th></th></tr></thead><tbody>{model_rows}</tbody></table>
-      </section>
+      </v-app-bar-title>
+      <template v-slot:append>
+        <v-chip v-if="activeModelName" class="mr-2" prepend-icon="mdi-brain" size="small" color="primary" variant="tonal">
+          {{{{ activeModelName }}}}
+        </v-chip>
+        <v-chip class="mr-2" size="small"
+                :color="isRunning ? 'warning' : 'success'"
+                :prepend-icon="isRunning ? 'mdi-refresh mdi-spin' : 'mdi-check-circle'"
+                variant="tonal">
+          {{{{ isRunning ? 'Entrenando' : 'Listo' }}}}
+        </v-chip>
+      </template>
+    </v-app-bar>
+
+    <!-- ════════════════════════════════════ MAIN ════════════════════════════════════ -->
+    <v-main>
+      <v-container fluid class="pa-4">
+
+        <v-tabs v-model="tab" color="primary" class="mb-4">
+          <v-tab value="inferencia" prepend-icon="mdi-magnify">Inferencia</v-tab>
+          <v-tab value="entrenar"   prepend-icon="mdi-weight-lifter">Entrenar</v-tab>
+          <v-tab value="historial"  prepend-icon="mdi-history">Historial</v-tab>
+        </v-tabs>
+
+        <v-tabs-window v-model="tab">
+
+          <!-- ═════════════════ TAB: INFERENCIA ═════════════════ -->
+          <v-tabs-window-item value="inferencia">
+            <v-row>
+
+              <!-- Modelo activo -->
+              <v-col cols="12" md="7">
+                <v-card variant="outlined" class="mb-4">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2" color="primary">mdi-brain</v-icon>
+                    Modelo activo para inferencia
+                  </v-card-title>
+                  <v-card-text>
+                    <v-select
+                      v-model="inferenceModelPath"
+                      :items="availableModels"
+                      item-title="label"
+                      item-value="path"
+                      label="Modelo"
+                      variant="outlined"
+                      density="compact"
+                      class="mb-3"
+                    ></v-select>
+                    <div class="d-flex align-center ga-2 mb-4 flex-wrap">
+                      <v-chip color="primary" size="small" prepend-icon="mdi-tune-variant">
+                        Confianza: {{{{ (confidence * 100).toFixed(0) }}}}%
+                      </v-chip>
+                      <v-chip
+                        v-for="label in activeLabels" :key="label"
+                        color="secondary" size="small" variant="tonal"
+                        prepend-icon="mdi-tag-outline"
+                      >
+                        {{{{ label }}}}
+                      </v-chip>
+                      <span v-if="activeLabels.length === 0" class="text-caption text-medium-emphasis">
+                        Sin etiquetas cargadas — Label Studio aún no hizo setup
+                      </span>
+                    </div>
+                    <v-btn
+                      color="primary"
+                      variant="flat"
+                      :loading="applyingModel"
+                      :disabled="!inferenceModelPath"
+                      @click="applyInferenceModel"
+                      prepend-icon="mdi-check"
+                    >
+                      Aplicar modelo
+                    </v-btn>
+                    <v-alert
+                      v-if="inferenceMsg"
+                      :type="inferenceMsgType"
+                      variant="tonal"
+                      class="mt-3"
+                      density="compact"
+                    >
+                      {{{{ inferenceMsg }}}}
+                    </v-alert>
+                  </v-card-text>
+                </v-card>
+              </v-col>
+
+              <!-- Info de conexión -->
+              <v-col cols="12" md="5">
+                <v-card variant="outlined" class="mb-4">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2" color="success">mdi-api</v-icon>
+                    Conexión Label Studio
+                  </v-card-title>
+                  <v-card-text>
+                    <table style="width:100%;border-collapse:collapse" class="nv-table">
+                      <tbody>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis" style="width:110px">Predicción</td>
+                          <td><code class="text-caption">POST /predict</code></td>
+                        </tr>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis">Setup</td>
+                          <td><code class="text-caption">POST /setup</code></td>
+                        </tr>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis">Health</td>
+                          <td><code class="text-caption">GET /health</code></td>
+                        </tr>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis">Confianza</td>
+                          <td class="text-caption">{{{{ (confidence * 100).toFixed(0) }}}}% (env CONFIDENCE_THRESHOLD)</td>
+                        </tr>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis">Ultralytics</td>
+                          <td class="text-caption">{{{{ ultralytics }}}}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </v-card-text>
+                </v-card>
+
+                <v-card variant="outlined">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2" color="warning">mdi-folder-multiple</v-icon>
+                    Modelos disponibles
+                  </v-card-title>
+                  <v-card-text class="pa-0">
+                    <v-list density="compact" class="pa-0">
+                      <v-list-item
+                        v-for="m in availableModels" :key="m.path"
+                        :subtitle="m.source"
+                        density="compact"
+                      >
+                        <template v-slot:prepend>
+                          <v-icon size="16" :color="m.active ? 'primary' : 'grey'">
+                            {{{{ m.active ? 'mdi-check-circle' : 'mdi-circle-outline' }}}}
+                          </v-icon>
+                        </template>
+                        <v-list-item-title class="text-caption">{{{{ m.label }}}}</v-list-item-title>
+                        <template v-slot:append>
+                          <v-chip v-if="m.active" size="x-small" color="primary">activo</v-chip>
+                        </template>
+                      </v-list-item>
+                      <v-list-item v-if="availableModels.length === 0">
+                        <v-list-item-title class="text-caption text-medium-emphasis">
+                          Sin modelos disponibles
+                        </v-list-item-title>
+                      </v-list-item>
+                    </v-list>
+                  </v-card-text>
+                </v-card>
+              </v-col>
+
+            </v-row>
+          </v-tabs-window-item>
+
+          <!-- ═════════════════ TAB: ENTRENAR ═════════════════ -->
+          <v-tabs-window-item value="entrenar">
+            <v-row>
+
+              <!-- Formulario de entrenamiento -->
+              <v-col cols="12" md="6">
+                <v-card variant="outlined" class="mb-4">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2" color="primary">mdi-cog</v-icon>
+                    Configuración de entrenamiento
+                  </v-card-title>
+                  <v-card-text>
+                    <v-alert v-if="trainProjects.length === 0" type="warning" variant="tonal" density="compact" class="mb-4">
+                      No se pudieron cargar proyectos desde Label Studio. Revisá conectividad y API key.
+                    </v-alert>
+
+                    <v-row dense>
+                      <v-col cols="12">
+                        <field-label
+                          label="Proyecto Label Studio"
+                          tooltip="Proyecto del que se exportan las anotaciones para construir el dataset de entrenamiento. Debe tener tareas con bounding boxes correctamente anotadas."
+                        ></field-label>
+                        <v-select
+                          v-model="trainForm.project"
+                          :items="trainProjects"
+                          item-title="label"
+                          item-value="id"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-select>
+                      </v-col>
+                      <v-col cols="12">
+                        <field-label
+                          label="Modelo base"
+                          tooltip="Modelo YOLO preentrenado desde el que se inicia el fine-tuning. Modelos más grandes (m, l, x) son más lentos pero potencialmente más precisos. Elegí el mismo tamaño que el modelo en producción para que los pesos sean compatibles."
+                        ></field-label>
+                        <v-select
+                          v-model="trainForm.model_path"
+                          :items="trainModels"
+                          item-title="label"
+                          item-value="path"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-select>
+                      </v-col>
+                      <v-col cols="12" sm="6">
+                        <field-label
+                          label="Device"
+                          tooltip="Dispositivo de cómputo para el entrenamiento.&#10;&#10;auto: selecciona GPU CUDA si está disponible, sino CPU.&#10;cpu: sin GPU, mucho más lento (puede ser 10-50× más lento que GPU).&#10;0, 1, ...: índice de GPU específica si hay varias instaladas."
+                        ></field-label>
+                        <v-select
+                          v-model="trainForm.device"
+                          :items="trainDevices"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-select>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Epochs"
+                          tooltip="Número máximo de pasadas completas sobre el dataset. YOLO suele converger en 50-300 epochs según el dataset. El early stopping (patience) puede detenerlo antes si deja de mejorar."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.epochs"
+                          type="number"
+                          min="1"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Patience"
+                          tooltip="Early stopping: epochs consecutivos sin mejora en mAP50-95 antes de detener automáticamente.&#10;&#10;0 = desactivado (entrena hasta el máximo de epochs).&#10;20 es el default. Para datasets pequeños se puede subir a 50."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.patience"
+                          type="number"
+                          min="0"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Image size"
+                          tooltip="Tamaño (en píxeles) al que se redimensionan las imágenes para entrenamiento e inferencia. Debe ser múltiplo de 32.&#10;&#10;640: default, buen balance velocidad/precisión.&#10;1280: más preciso en objetos pequeños, pero usa el doble de VRAM.&#10;Debe coincidir con el tamaño usado en inferencia."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.imgsz"
+                          type="number"
+                          min="32"
+                          step="32"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Batch"
+                          tooltip="Imágenes procesadas en paralelo por paso de gradiente. Más grande = gradiente más estable y entrenamiento más rápido, pero más VRAM.&#10;&#10;Si aparece 'CUDA out of memory', reducir a la mitad.&#10;-1: auto (YOLO elige según VRAM disponible)."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.batch"
+                          type="number"
+                          min="1"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Workers"
+                          tooltip="Procesos paralelos del DataLoader para cargar imágenes desde disco. Más workers = carga más rápida si el disco es el cuello de botella.&#10;&#10;Usá 0 si el entrenamiento falla al iniciar — algunos entornos Docker no soportan multiprocessing con fork."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.workers"
+                          type="number"
+                          min="0"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="LR inicial (lr0)"
+                          tooltip="Learning rate inicial del optimizador SGD. YOLO aplica warmup lineal en las primeras epochs y luego decaimiento cosine hasta lr_f.&#10;&#10;0.01: default para fine-tuning desde cero.&#10;Demasiado alto: entrenamiento inestable (loss diverge).&#10;Demasiado bajo: convergencia muy lenta."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.lr0"
+                          type="number"
+                          min="0"
+                          step="0.0001"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Weight decay"
+                          tooltip="Regularización L2 del optimizador: penaliza pesos grandes para reducir sobreajuste.&#10;&#10;0.0005: default de YOLO, funciona bien en la mayoría de casos.&#10;Aumentarlo (0.001) si el modelo sobreajusta.&#10;Reducirlo (0.00001) si el dataset es muy pequeño."
+                        ></field-label>
+                        <v-text-field
+                          v-model.number="trainForm.weight_decay"
+                          type="number"
+                          min="0"
+                          step="0.00001"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-text-field>
+                      </v-col>
+                      <v-col cols="6" sm="3">
+                        <field-label
+                          label="Cosine LR"
+                          tooltip="Activa el scheduler cosine annealing: el learning rate decae siguiendo una curva coseno desde lr0 hasta lr_f.&#10;&#10;Recomendado para entrenamientos largos (>100 epochs). Produce convergencia más suave que el decay lineal."
+                        ></field-label>
+                        <v-select
+                          v-model="trainForm.cos_lr"
+                          :items="[{{title:'No',value:false}},{{title:'Sí',value:true}}]"
+                          item-title="title"
+                          item-value="value"
+                          variant="outlined"
+                          density="compact"
+                          hide-details
+                        ></v-select>
+                      </v-col>
+                      <v-col cols="12">
+                        <field-label
+                          label="Train split"
+                          tooltip="Porcentaje de imágenes del proyecto que se usan para entrenamiento. El resto se reserva para validación.&#10;&#10;80/20: default recomendado con datasets medianos (>500 imágenes).&#10;Con datasets muy pequeños (<200) puede subirse a 90/10, aunque la señal de validación será más ruidosa."
+                        ></field-label>
+                        <div class="text-caption text-medium-emphasis mb-1">
+                          <strong>{{{{ trainForm.train_percent }}}}%</strong> train /
+                          <strong>{{{{ 100 - trainForm.train_percent }}}}%</strong> valid
+                        </div>
+                        <v-slider
+                          v-model="trainForm.train_percent"
+                          min="1" max="99" step="1"
+                          color="primary"
+                          thumb-label
+                          density="compact"
+                          hide-details
+                        ></v-slider>
+                      </v-col>
+                    </v-row>
+
+                    <!-- Upload modelo externo -->
+                    <v-divider class="my-3"></v-divider>
+                    <div class="text-caption text-medium-emphasis mb-2">Modelo externo (.pt)</div>
+                    <div class="d-flex align-center ga-2">
+                      <v-file-input
+                        v-model="externalModelFile"
+                        label="Subir .pt como modelo base"
+                        accept=".pt"
+                        variant="outlined"
+                        density="compact"
+                        prepend-icon=""
+                        hide-details
+                        style="flex:1"
+                      ></v-file-input>
+                      <v-btn
+                        variant="outlined"
+                        :loading="uploadingModel"
+                        :disabled="!externalModelFile || !externalModelFile.length"
+                        @click="uploadExternalModel"
+                        size="small"
+                      >Subir</v-btn>
+                    </div>
+                    <div v-if="uploadMsg" class="text-caption mt-1" :class="uploadOk ? 'text-success' : 'text-error'">
+                      {{{{ uploadMsg }}}}
+                    </div>
+
+                    <v-divider class="my-4"></v-divider>
+                    <v-btn
+                      color="primary"
+                      variant="flat"
+                      :loading="startingTrain"
+                      :disabled="isRunning || !trainForm.project"
+                      @click="startTraining"
+                      prepend-icon="mdi-play"
+                      block
+                    >Iniciar entrenamiento</v-btn>
+                    <div v-if="startTrainMsg" class="text-caption mt-2" :class="startTrainOk ? 'text-success' : 'text-error'">
+                      {{{{ startTrainMsg }}}}
+                    </div>
+                  </v-card-text>
+                </v-card>
+              </v-col>
+
+              <!-- Card progreso live (solo si hay job running/queued) -->
+              <v-col cols="12" md="6">
+                <v-card v-if="runningJob" variant="outlined" color="warning" class="mb-4">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2 mdi-spin" color="warning">mdi-loading</v-icon>
+                    Entrenamiento en curso
+                  </v-card-title>
+                  <v-card-text>
+                    <div class="text-caption text-medium-emphasis mb-1">
+                      Proyecto {{{{ runningJob.project }}}}
+                    </div>
+                    <div class="d-flex align-center justify-space-between mb-1">
+                      <span class="text-body-2">
+                        Época {{{{ runningJob.progress && runningJob.progress.current_epoch || 0 }}}}
+                        / {{{{ runningJob.progress && runningJob.progress.total_epochs || '—' }}}}
+                      </span>
+                      <span class="text-caption text-medium-emphasis">{{{{ fmtDuration(runningJob.elapsed_seconds) }}}}</span>
+                    </div>
+                    <v-progress-linear
+                      :model-value="epochPct(runningJob)"
+                      color="warning"
+                      height="8"
+                      rounded
+                      class="mb-3"
+                    ></v-progress-linear>
+
+                    <div class="d-flex ga-2 flex-wrap mb-3">
+                      <v-chip color="success" size="small" variant="tonal">
+                        Best epoch: {{{{ runningJob.metrics && runningJob.metrics.summary && runningJob.metrics.summary.best_epoch !== null ? runningJob.metrics.summary.best_epoch : '—' }}}}
+                      </v-chip>
+                      <v-chip color="primary" size="small" variant="tonal">
+                        mAP50-95: {{{{ runningJob.metrics && runningJob.metrics.summary && runningJob.metrics.summary.best_metric !== null ? Number(runningJob.metrics.summary.best_metric).toFixed(4) : '—' }}}}
+                      </v-chip>
+                      <v-chip size="small" variant="tonal">
+                        {{{{ runningJob.phase || runningJob.status }}}}
+                      </v-chip>
+                    </div>
+
+                    <div class="text-caption text-medium-emphasis mb-4">{{{{ runningJob.message }}}}</div>
+
+                    <v-btn
+                      color="error"
+                      variant="outlined"
+                      size="small"
+                      @click="cancelJob(runningJob.id)"
+                      prepend-icon="mdi-stop"
+                    >Cancelar entrenamiento</v-btn>
+                  </v-card-text>
+                </v-card>
+
+                <v-alert v-else type="info" variant="tonal">
+                  Sin entrenamiento activo. Completá el formulario y hacé clic en "Iniciar entrenamiento".
+                </v-alert>
+              </v-col>
+
+            </v-row>
+          </v-tabs-window-item>
+
+          <!-- ═════════════════ TAB: HISTORIAL ═════════════════ -->
+          <v-tabs-window-item value="historial">
+            <v-alert v-if="jobs.length === 0" type="info" variant="tonal" class="mt-2">
+              Todavía no hay jobs de entrenamiento.
+            </v-alert>
+            <v-row v-else>
+
+              <!-- ── Lista de jobs (izquierda) ── -->
+              <v-col cols="12" md="4" lg="3">
+                <v-list density="compact" nav>
+                  <v-list-item
+                    v-for="job in jobs" :key="job.id"
+                    :active="selectedJobId === job.id"
+                    @click="selectJob(job)"
+                    rounded="lg"
+                    class="mb-1 pa-2"
+                  >
+                    <template v-slot:prepend>
+                      <v-icon :color="statusColor(job.status)" size="18" class="mr-2">
+                        {{{{ statusIcon(job.status) }}}}
+                      </v-icon>
+                    </template>
+                    <v-list-item-title class="text-body-2 font-weight-medium">
+                      Proyecto {{{{ job.project }}}}
+                    </v-list-item-title>
+                    <v-list-item-subtitle class="text-caption">
+                      <v-chip :color="statusColor(job.status)" size="x-small" variant="tonal" class="mr-1">
+                        {{{{ job.status }}}}
+                      </v-chip>
+                      {{{{ fmtDuration(job.elapsed_seconds) }}}}
+                    </v-list-item-subtitle>
+                    <v-list-item-subtitle v-if="job.metrics && job.metrics.summary && job.metrics.summary.best_metric != null" class="text-caption mt-1">
+                      Best ep.{{{{ job.metrics.summary.best_epoch }}}} · mAP {{{{ Number(job.metrics.summary.best_metric).toFixed(4) }}}}
+                    </v-list-item-subtitle>
+                    <template v-slot:append>
+                      <v-tooltip text="Eliminar job" location="top">
+                        <template v-slot:activator="{{ props }}">
+                          <v-btn
+                            v-bind="props"
+                            icon size="x-small" variant="text" color="error"
+                            :disabled="job.status === 'running'"
+                            @click.stop="deleteJob(job.id)"
+                          >
+                            <v-icon size="16">mdi-delete-outline</v-icon>
+                          </v-btn>
+                        </template>
+                      </v-tooltip>
+                    </template>
+                  </v-list-item>
+                </v-list>
+              </v-col>
+
+              <!-- ── Detalle del job (derecha) ── -->
+              <v-col cols="12" md="8" lg="9">
+                <v-alert v-if="!selectedJob" type="info" variant="tonal">
+                  Seleccioná un job para ver el detalle.
+                </v-alert>
+
+                <div v-else>
+
+                  <!-- Resumen -->
+                  <v-card variant="outlined" class="mb-3">
+                    <v-card-title class="text-body-2 font-weight-bold pt-3 pb-1 d-flex align-center justify-space-between">
+                      <span>
+                        <v-icon size="16" class="mr-1" color="primary">mdi-information-outline</v-icon>
+                        Resumen · job {{{{ selectedJob.id ? selectedJob.id.substring(0,8) : '' }}}}
+                      </span>
+                      <div class="d-flex ga-1">
+                        <v-btn
+                          v-if="selectedJob.trained_model"
+                          size="x-small" variant="tonal" color="success"
+                          prepend-icon="mdi-download"
+                          :href="'/download/models/' + selectedJob.trained_model.split('/').pop()"
+                        >Descargar</v-btn>
+                        <v-btn
+                          v-if="selectedJob.trained_model"
+                          size="x-small" variant="tonal" color="primary"
+                          prepend-icon="mdi-play"
+                          @click="useForInference(selectedJob.trained_model)"
+                        >Usar para inferencia</v-btn>
+                      </div>
+                    </v-card-title>
+                    <v-card-text class="pa-0">
+                      <table style="width:100%;border-collapse:collapse" class="nv-table">
+                        <tbody>
+                          <tr>
+                            <td class="text-caption text-medium-emphasis" style="width:140px;padding:6px 16px">Status</td>
+                            <td style="padding:6px 16px">
+                              <v-chip :color="statusColor(selectedJob.status)" size="x-small" variant="tonal">
+                                {{{{ selectedJob.status }}}}
+                              </v-chip>
+                            </td>
+                          </tr>
+                          <tr>
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Proyecto LS</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.project }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.train_config && selectedJob.train_config.model_path">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Modelo base</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.train_config.model_path.split('/').pop() }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.train_config && selectedJob.train_config.device">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Device</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.train_config.device }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.dataset">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Dataset</td>
+                            <td class="text-caption" style="padding:6px 16px">
+                              {{{{ selectedJob.dataset.train_images || '?' }}}} train /
+                              {{{{ selectedJob.dataset.val_images || '?' }}}} val
+                              <span v-if="selectedJob.dataset.train_percent"> ({{{{ selectedJob.dataset.train_percent }}}}% train)</span>
+                            </td>
+                          </tr>
+                          <tr v-if="selectedJob.started_at">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Iniciado</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ fmtDate(selectedJob.started_at) }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.finished_at">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Finalizado</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ fmtDate(selectedJob.finished_at) }}}}</td>
+                          </tr>
+                          <tr>
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Duración</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ fmtDuration(selectedJob.elapsed_seconds) }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.trained_model">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Modelo resultado</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.trained_model.split('/').pop() }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.message">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Mensaje</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.message }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.error">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Error</td>
+                            <td class="text-caption text-error" style="padding:6px 16px">{{{{ selectedJob.error }}}}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </v-card-text>
+                  </v-card>
+
+                  <!-- Best y paciencia -->
+                  <v-card v-if="selectedJob.metrics && selectedJob.metrics.summary && Object.keys(selectedJob.metrics.summary).length" variant="outlined" class="mb-3">
+                    <v-card-title class="text-body-2 font-weight-bold pt-3 pb-2">
+                      <v-icon size="16" class="mr-1" color="success">mdi-trophy-outline</v-icon>
+                      Best y paciencia
+                    </v-card-title>
+                    <v-card-text>
+                      <div class="d-flex ga-2 flex-wrap mb-3">
+                        <v-chip color="success" size="small" variant="tonal" prepend-icon="mdi-star">
+                          Best epoch: {{{{ selectedJob.metrics.summary.best_epoch != null ? selectedJob.metrics.summary.best_epoch : '—' }}}}
+                        </v-chip>
+                        <v-chip color="success" size="small" variant="tonal" prepend-icon="mdi-chart-line">
+                          Best mAP50-95: {{{{ selectedJob.metrics.summary.best_metric != null ? Number(selectedJob.metrics.summary.best_metric).toFixed(4) : '—' }}}}
+                        </v-chip>
+                        <v-chip size="small" variant="tonal">
+                          Epoch actual: {{{{ selectedJob.metrics.summary.current_epoch != null ? selectedJob.metrics.summary.current_epoch : '—' }}}}
+                        </v-chip>
+                        <v-chip :color="patienceColor(selectedJob)" size="small" variant="tonal">
+                          Sin mejora: {{{{ selectedJob.metrics.summary.epochs_without_improvement != null ? selectedJob.metrics.summary.epochs_without_improvement : '—' }}}} / {{{{ selectedJob.metrics.summary.patience }}}}
+                        </v-chip>
+                      </div>
+                      <div class="text-caption text-medium-emphasis mb-1">Paciencia consumida</div>
+                      <v-progress-linear
+                        :model-value="patiencePct(selectedJob)"
+                        :color="patienceColor(selectedJob)"
+                        height="8"
+                        rounded
+                      ></v-progress-linear>
+                    </v-card-text>
+                  </v-card>
+
+                  <!-- Métricas YOLO (14 valores) -->
+                  <v-card v-if="selectedJob.metrics && selectedJob.metrics.latest && Object.keys(selectedJob.metrics.latest).length" variant="outlined" class="mb-3">
+                    <v-card-title class="text-body-2 font-weight-bold pt-3 pb-2">
+                      <v-icon size="16" class="mr-1" color="warning">mdi-gauge</v-icon>
+                      Métricas YOLO — última época
+                    </v-card-title>
+                    <v-card-text>
+                      <div class="d-flex ga-2 flex-wrap">
+                        <v-chip
+                          v-for="[key, label] in metricLabels" :key="key"
+                          :color="key === 'metrics/mAP50-95(B)' ? 'success' : undefined"
+                          :size="key === 'metrics/mAP50-95(B)' ? 'default' : 'small'"
+                          :variant="key === 'metrics/mAP50-95(B)' ? 'flat' : 'tonal'"
+                        >
+                          {{{{ label }}}}: {{{{ selectedJob.metrics.latest[key] || '—' }}}}
+                        </v-chip>
+                      </div>
+                    </v-card-text>
+                  </v-card>
+
+                  <!-- Curvas SVG -->
+                  <v-card v-if="selectedJob.metrics && selectedJob.metrics.rows && selectedJob.metrics.rows.length > 1" variant="outlined" class="mb-3">
+                    <v-card-title class="text-body-2 font-weight-bold pt-3 pb-2">
+                      <v-icon size="16" class="mr-1" color="info">mdi-chart-bell-curve-cumulative</v-icon>
+                      Curvas de entrenamiento
+                    </v-card-title>
+                    <v-card-text>
+                      <div class="chart-grid" v-html="chartsHtml"></div>
+                    </v-card-text>
+                  </v-card>
+
+                </div>
+              </v-col>
+            </v-row>
+
+            <!-- Tabla de modelos entrenados -->
+            <v-card v-if="modelsTable.length" variant="outlined" class="mt-4">
+              <v-card-title class="text-body-2 font-weight-bold pt-3 pb-1">
+                <v-icon size="16" class="mr-1" color="primary">mdi-file-cog-outline</v-icon>
+                Modelos entrenados ({{{{ modelsTable.length }}}})
+              </v-card-title>
+              <v-card-text class="pa-0">
+                <table style="width:100%;border-collapse:collapse" class="nv-table">
+                  <thead>
+                    <tr>
+                      <th class="text-caption">Nombre</th>
+                      <th class="text-caption">Tamaño</th>
+                      <th class="text-caption">mAP50-95</th>
+                      <th class="text-caption">Proyecto</th>
+                      <th class="text-caption">Fecha</th>
+                      <th class="text-caption">Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="m in modelsTable" :key="m.path">
+                      <td class="text-caption">
+                        <v-chip v-if="m.active" color="success" size="x-small" variant="flat" class="mr-1">activo</v-chip>
+                        {{{{ m.name }}}}
+                      </td>
+                      <td class="text-caption">{{{{ m.sizeLabel }}}}</td>
+                      <td class="text-caption">{{{{ m.map5095 }}}}</td>
+                      <td class="text-caption">{{{{ m.project }}}}</td>
+                      <td class="text-caption">{{{{ m.modifiedLabel }}}}</td>
+                      <td>
+                        <v-tooltip text="Descargar modelo (.pt)" location="top">
+                          <template v-slot:activator="{{ props }}">
+                            <v-btn
+                              v-bind="props"
+                              icon size="x-small" variant="text"
+                              :href="'/download/models/' + m.name" target="_blank"
+                            >
+                              <v-icon size="16">mdi-download</v-icon>
+                            </v-btn>
+                          </template>
+                        </v-tooltip>
+                        <v-tooltip text="Activar para inferencia y cambiar al tab Inferencia" location="top">
+                          <template v-slot:activator="{{ props }}">
+                            <v-btn
+                              v-bind="props"
+                              icon size="x-small" variant="text" color="primary"
+                              @click="useForInference(m.path)"
+                            >
+                              <v-icon size="16">mdi-play</v-icon>
+                            </v-btn>
+                          </template>
+                        </v-tooltip>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </v-card-text>
+            </v-card>
+
+          </v-tabs-window-item>
+
+        </v-tabs-window>
+      </v-container>
+    </v-main>
+
+  </v-app>
+</div>
+
+<script>const INITIAL_DATA = {initial_data};</script>
+<script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vuetify@3/dist/vuetify.min.js"></script>
+<script>
+const {{ createApp, ref, computed, watch, onMounted, onUnmounted }} = Vue;
+const {{ createVuetify }} = Vuetify;
+
+// Componente reutilizable: label + tooltip de ayuda (igual que lpr-ocr-labeler)
+const FieldLabel = {{
+  props: {{ label: String, tooltip: String }},
+  template: `
+    <div class="d-flex align-center mb-1">
+      <span style="font-size:12px;font-weight:600;color:rgba(255,255,255,.6)">{{{{ label }}}}</span>
+      <v-tooltip v-if="tooltip" :text="tooltip" location="top end" max-width="320" open-delay="150">
+        <template v-slot:activator="{{ props }}">
+          <v-icon v-bind="props" size="14" color="grey-darken-1" style="margin-left:4px;cursor:help">
+            mdi-information-outline
+          </v-icon>
+        </template>
+      </v-tooltip>
     </div>
-  </main>
-  <script>
-    let selectedJobId = {initial_selected_job_id};
-    let selectedJobStatus = {initial_selected_job_status};
-    const trainForm = document.getElementById('train-form');
-    const trainFormStorageKey = 'yolo11.trainForm';
-    restoreTrainForm();
-    bindTrainSplitSlider();
-    bindTrainFormStorage();
-    bindProjectModelFilter();
-    bindExternalModelUpload();
-    filterBaseModels();
-    bindJobEvents();
-    function trainFormData() {{
-      return Object.fromEntries(new FormData(trainForm).entries());
+  `,
+}};
+
+const vuetify = createVuetify({{
+  theme: {{
+    defaultTheme: 'dark',
+    themes: {{
+      dark: {{
+        dark: true,
+        colors: {{
+          background: '#121212',
+          surface: '#1e1e1e',
+          primary: '#1976D2',
+          success: '#4CAF50',
+          warning: '#FF9800',
+          error: '#ef5350',
+        }},
+      }},
+    }},
+  }},
+  icons: {{ defaultSet: 'mdi' }},
+}});
+
+createApp({{
+  setup() {{
+    const tab = ref('historial');
+    const jobs = ref([]);
+    const selectedJobId = ref(null);
+    const selectedJob = ref(null);
+    const activeModelName = ref(INITIAL_DATA.currentModelName || '');
+
+    // ── Entrenar ──
+    const TRAIN_STORAGE_KEY = 'yolo11.trainForm';
+    function loadSavedForm() {{
+      try {{ return JSON.parse(localStorage.getItem(TRAIN_STORAGE_KEY) || 'null'); }}
+      catch {{ return null; }}
     }}
-    function restoreTrainForm() {{
+    function saveForm(form) {{
+      try {{ localStorage.setItem(TRAIN_STORAGE_KEY, JSON.stringify(form)); }} catch {{}}
+    }}
+    const _saved = loadSavedForm();
+    const trainForm = ref({{
+      project: _saved && _saved.project != null ? _saved.project : null,
+      model_path: (_saved && _saved.model_path) || '',
+      device: (_saved && _saved.device) || INITIAL_DATA.defaults.device || 'auto',
+      epochs: (_saved && _saved.epochs != null) ? _saved.epochs : INITIAL_DATA.defaults.epochs,
+      imgsz: (_saved && _saved.imgsz != null) ? _saved.imgsz : INITIAL_DATA.defaults.imgsz,
+      batch: (_saved && _saved.batch != null) ? _saved.batch : INITIAL_DATA.defaults.batch,
+      patience: (_saved && _saved.patience != null) ? _saved.patience : INITIAL_DATA.defaults.patience,
+      workers: (_saved && _saved.workers != null) ? _saved.workers : INITIAL_DATA.defaults.workers,
+      lr0: (_saved && _saved.lr0 != null) ? _saved.lr0 : INITIAL_DATA.defaults.lr0,
+      weight_decay: (_saved && _saved.weight_decay != null) ? _saved.weight_decay : INITIAL_DATA.defaults.weightDecay,
+      cos_lr: (_saved && _saved.cos_lr != null) ? _saved.cos_lr : INITIAL_DATA.defaults.cosLr,
+      train_percent: (_saved && _saved.train_percent != null) ? _saved.train_percent : INITIAL_DATA.defaults.splitPercent,
+    }});
+    const trainProjects = ref(
+      (INITIAL_DATA.projects || []).map(p => ({{
+        id: p.id,
+        label: p.id + ' — ' + p.title + (p.task_count ? ' (' + p.task_count + ' imágenes)' : ''),
+      }}))
+    );
+    watch(trainForm, (val) => saveForm(val), {{ deep: true }});
+
+    const trainDevices = ref(
+      ['auto', 'cpu'].concat((INITIAL_DATA.devices || []).map((name, i) => ({{ title: i + ' — ' + name, value: String(i) }})))
+    );
+    const trainModels = ref([]);
+    const modelsTable = ref([]);
+    const externalModelFile = ref(null);
+    const uploadingModel = ref(false);
+    const uploadMsg = ref('');
+    const uploadOk = ref(true);
+    const startingTrain = ref(false);
+    const startTrainMsg = ref('');
+    const startTrainOk = ref(true);
+    const runningJob = computed(() => jobs.value.find(j => j.status === 'running' || j.status === 'queued') || null);
+
+    // ── Inferencia ──
+    const availableModels = ref([]);
+    const inferenceModelPath = ref(INITIAL_DATA.currentModelPath || '');
+    const activeLabels = ref([]);
+    const confidence = ref(INITIAL_DATA.confidenceThreshold || 0.25);
+    const ultralytics = ref(INITIAL_DATA.ultralytics || '');
+    const applyingModel = ref(false);
+    const inferenceMsg = ref('');
+    const inferenceMsgType = ref('success');
+
+    const isRunning = computed(() =>
+      jobs.value.some(j => j.status === 'running' || j.status === 'queued')
+    );
+
+    function statusColor(status) {{
+      return {{ running: 'warning', queued: 'info', completed: 'success', failed: 'error', cancelled: 'grey' }}[status] || 'grey';
+    }}
+    function statusIcon(status) {{
+      return {{ running: 'mdi-loading', queued: 'mdi-clock-outline', completed: 'mdi-check-circle', failed: 'mdi-alert-circle', cancelled: 'mdi-cancel' }}[status] || 'mdi-help-circle';
+    }}
+    function fmtDuration(secs) {{
+      secs = Math.max(Math.floor(secs || 0), 0);
+      const h = Math.floor(secs / 3600); secs %= 3600;
+      const m = Math.floor(secs / 60); const s = secs % 60;
+      return (h ? h + 'h ' : '') + (h || m ? m + 'm ' : '') + s + 's';
+    }}
+
+    function epochPct(job) {{
+      if (!job || !job.progress) return 0;
+      const {{ current_epoch, total_epochs }} = job.progress;
+      if (!total_epochs) return 0;
+      return Math.round((current_epoch / total_epochs) * 100);
+    }}
+
+    async function uploadExternalModel() {{
+      if (!externalModelFile.value || !externalModelFile.value.length) return;
+      uploadingModel.value = true; uploadMsg.value = '';
       try {{
-        const saved = JSON.parse(localStorage.getItem(trainFormStorageKey) || '{{}}');
-        Object.entries(saved).forEach(([key, value]) => {{
-          const field = trainForm.elements[key];
-          if (!field) return;
-          if (field.tagName === 'SELECT' && !Array.from(field.options).some(option => option.value === String(value))) return;
-          field.value = value;
+        const fd = new FormData();
+        fd.append('model', externalModelFile.value[0]);
+        const res = await fetch('/api/external-models', {{ method: 'POST', body: fd }});
+        const data = await res.json().catch(() => ({{}}));
+        if (res.ok) {{
+          uploadMsg.value = 'Modelo subido: ' + data.model.name;
+          uploadOk.value = true;
+          trainForm.value.model_path = data.model.path;
+          await fetchModels();
+        }} else {{
+          uploadMsg.value = 'Error: ' + (data.message || JSON.stringify(data));
+          uploadOk.value = false;
+        }}
+      }} catch (e) {{
+        uploadMsg.value = 'Error de red: ' + e.message;
+        uploadOk.value = false;
+      }} finally {{
+        uploadingModel.value = false;
+      }}
+    }}
+
+    async function startTraining() {{
+      startingTrain.value = true; startTrainMsg.value = '';
+      try {{
+        const payload = {{
+          project: Number(trainForm.value.project),
+          model_path: trainForm.value.model_path,
+          device: trainForm.value.device,
+          epochs: Number(trainForm.value.epochs),
+          imgsz: Number(trainForm.value.imgsz),
+          batch: Number(trainForm.value.batch),
+          patience: Number(trainForm.value.patience),
+          workers: Number(trainForm.value.workers),
+          lr0: Number(trainForm.value.lr0),
+          weight_decay: Number(trainForm.value.weight_decay),
+          cos_lr: Boolean(trainForm.value.cos_lr),
+          train_percent: Number(trainForm.value.train_percent),
+        }};
+        const res = await fetch('/train', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload),
         }});
-      }} catch (error) {{
-        console.warn('No se pudo restaurar el formulario de entrenamiento', error);
+        const data = await res.json();
+        if (res.ok && data.status !== 'busy') {{
+          startTrainMsg.value = 'Job iniciado: ' + data.job_id;
+          startTrainOk.value = true;
+          await fetchJobs();
+        }} else if (data.status === 'busy') {{
+          startTrainMsg.value = 'Ya hay un entrenamiento corriendo.';
+          startTrainOk.value = false;
+        }} else {{
+          startTrainMsg.value = 'Error: ' + (data.message || JSON.stringify(data));
+          startTrainOk.value = false;
+        }}
+      }} catch (e) {{
+        startTrainMsg.value = 'Error de red: ' + e.message;
+        startTrainOk.value = false;
+      }} finally {{
+        startingTrain.value = false;
       }}
     }}
-    function saveTrainForm() {{
-      localStorage.setItem(trainFormStorageKey, JSON.stringify(trainFormData()));
-    }}
-    function bindTrainFormStorage() {{
-      trainForm.addEventListener('input', saveTrainForm);
-      trainForm.addEventListener('change', saveTrainForm);
-    }}
-    function bindProjectModelFilter() {{
-      trainForm.elements.project.addEventListener('change', () => {{
-        filterBaseModels();
-        saveTrainForm();
-      }});
-    }}
-    function filterBaseModels() {{
-      const project = String(trainForm.elements.project.value || '');
-      const modelSelect = trainForm.elements.model_path;
-      let selectedVisible = false;
-      Array.from(modelSelect.options).forEach(option => {{
-        const visible = option.dataset.source !== 'entrenado' || option.dataset.project === project;
-        option.hidden = !visible;
-        option.disabled = !visible;
-        if (option.selected && visible) selectedVisible = true;
-      }});
-      if (!selectedVisible) {{
-        const firstVisible = Array.from(modelSelect.options).find(option => !option.disabled);
-        if (firstVisible) modelSelect.value = firstVisible.value;
+
+    async function cancelJob(jobId) {{
+      const res = await fetch('/api/jobs/' + jobId + '/cancel', {{ method: 'POST' }});
+      const data = await res.json().catch(() => ({{}}));
+      if (res.ok) {{
+        startTrainMsg.value = 'Entrenamiento cancelado. El backend se reiniciará.';
+        startTrainOk.value = true;
+        setTimeout(fetchJobs, 2500);
+      }} else {{
+        startTrainMsg.value = 'Error al cancelar: ' + (data.message || '');
+        startTrainOk.value = false;
       }}
     }}
-    function bindExternalModelUpload() {{
-      document.getElementById('upload-external-model').addEventListener('click', async () => {{
-        const notice = document.getElementById('train-notice');
-        const fileInput = document.getElementById('external-model-file');
-        const file = fileInput.files && fileInput.files[0];
-        if (!file) {{ notice.textContent = 'Selecciona un archivo .pt para subir como modelo externo.'; return; }}
-        const data = new FormData();
-        data.append('model', file);
-        notice.textContent = 'Subiendo modelo externo...';
-        const res = await fetch('/api/external-models', {{method: 'POST', body: data}});
-        const body = await res.json().catch(() => ({{}}));
-        if (!res.ok) {{ notice.textContent = 'Error subiendo modelo externo: ' + (body.message || JSON.stringify(body)); return; }}
-        const saved = trainFormData();
-        saved.model_path = body.model.path;
-        localStorage.setItem(trainFormStorageKey, JSON.stringify(saved));
-        notice.textContent = 'Modelo externo cargado. Recargando opciones...';
-        setTimeout(() => location.reload(), 500);
-      }});
+
+    async function fetchModels() {{
+      try {{
+        const res = await fetch('/api/models');
+        const data = await res.json();
+        const opts = data.available_models || [];
+        availableModels.value = opts.map(m => ({{
+          ...m,
+          label: m.name + (m.source === 'entrenado' && m.project ? ' [proy ' + m.project + ']' : '') + (m.active ? ' ✓' : ''),
+        }}));
+        trainModels.value = opts.map(m => ({{
+          path: m.path,
+          label: m.name + (m.source === 'entrenado' && m.project ? ' [proy ' + m.project + ']' : ''),
+        }}));
+        const active = opts.find(m => m.active);
+        if (active) {{
+          activeModelName.value = active.name;
+          inferenceModelPath.value = active.path;
+          if (!trainForm.value.model_path) trainForm.value.model_path = active.path;
+        }}
+        modelsTable.value = (data.models || []).map(m => {{
+          const lat = (m.metadata && m.metadata.metrics && m.metadata.metrics.latest) || {{}};
+          return {{
+            ...m,
+            map5095: lat['metrics/mAP50-95(B)'] != null ? Number(lat['metrics/mAP50-95(B)']).toFixed(4) : '—',
+            project: (m.metadata && m.metadata.dataset && m.metadata.dataset.project) || '—',
+            modifiedLabel: m.modified_at ? new Date(m.modified_at * 1000).toLocaleDateString('es-AR') : '—',
+            sizeLabel: fmtSize(m.size),
+          }};
+        }});
+      }} catch (e) {{
+        console.warn('Error fetching models', e);
+      }}
     }}
-    function bindTrainSplitSlider() {{
-      const slider = document.getElementById('train-percent');
-      const trainValue = document.getElementById('train-percent-value');
-      const valValue = document.getElementById('val-percent-value');
-      const update = () => {{
-        const value = Number(slider.value);
-        trainValue.textContent = value + '%';
-        valValue.textContent = (100 - value) + '%';
-      }};
-      slider.addEventListener('input', update);
-      update();
+
+    async function fetchStatus() {{
+      try {{
+        const res = await fetch('/status');
+        const data = await res.json();
+        if (Array.isArray(data.labels)) activeLabels.value = data.labels;
+      }} catch (e) {{
+        console.warn('Error fetching status', e);
+      }}
     }}
-    function setDatasetStatus(dataset) {{
-      dataset = dataset || {{}};
-      document.getElementById('status-train-images').textContent = dataset.train_images ?? 'n/d';
-      document.getElementById('status-val-images').textContent = dataset.val_images ?? 'n/d';
-      document.getElementById('status-train-split').textContent = dataset.train_percent === undefined ? 'n/d' : dataset.train_percent + '%';
+
+    async function applyInferenceModel() {{
+      applyingModel.value = true;
+      inferenceMsg.value = '';
+      try {{
+        const res = await fetch('/api/active-model', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ model_path: inferenceModelPath.value }}),
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          inferenceMsg.value = 'Modelo activado: ' + (data.active_model_path || inferenceModelPath.value);
+          inferenceMsgType.value = 'success';
+          activeModelName.value = inferenceModelPath.value.split('/').pop();
+          await fetchModels();
+        }} else {{
+          inferenceMsg.value = 'Error: ' + (data.message || JSON.stringify(data));
+          inferenceMsgType.value = 'error';
+        }}
+      }} catch (e) {{
+        inferenceMsg.value = 'Error de red: ' + e.message;
+        inferenceMsgType.value = 'error';
+      }} finally {{
+        applyingModel.value = false;
+      }}
     }}
-    function renderMetricCells(latest, emptyText) {{
-      const labels = {json.dumps(metric_labels, ensure_ascii=False)};
-      return Object.keys(latest).length
-        ? labels.map(([key, label]) => `<div class='metric-cell ${{key === 'metrics/mAP50-95(B)' ? 'metric-highlight' : ''}}'><small>${{label}}</small><strong>${{latest[key] || ''}}</strong></div>`).join('')
-        : `<div class='empty'>${{emptyText}}</div>`;
+
+    async function fetchJobs() {{
+      try {{
+        const res = await fetch('/api/jobs');
+        const data = await res.json();
+        jobs.value = data.jobs || [];
+        if (selectedJobId.value) {{
+          const found = jobs.value.find(j => j.id === selectedJobId.value);
+          if (found) selectedJob.value = found;
+        }}
+      }} catch (e) {{
+        console.warn('Error fetching jobs', e);
+      }}
     }}
-    function bindJobEvents() {{
-      document.querySelectorAll('.job-card').forEach(btn => btn.onclick = async () => {{
-        selectedJobId = btn.dataset.job;
-        await loadJob(selectedJobId);
-      }});
-      document.querySelectorAll('[data-delete-job]').forEach(btn => btn.onclick = async (event) => {{
-      event.preventDefault();
-      event.stopPropagation();
-      const jobId = btn.dataset.deleteJob;
-      if (!confirm('Eliminar este job y todos sus datos asociados? Esto borra modelo entrenado, métricas, run y dataset convertido.')) return;
-      const res = await fetch('/api/jobs/' + jobId, {{method: 'DELETE'}});
-      const body = await res.json().catch(() => ({{}}));
-      if (!res.ok) {{ alert('No se pudo eliminar: ' + (body.message || JSON.stringify(body))); return; }}
-      if (selectedJobId === jobId) selectedJobId = null;
-      location.reload();
-      }});
-      document.querySelectorAll('[data-cancel-job]').forEach(btn => btn.onclick = async (event) => {{
-      event.preventDefault();
-      event.stopPropagation();
-      const jobId = btn.dataset.cancelJob;
-      if (!confirm('Cancelar este entrenamiento en ejecución? El backend se reiniciará para detener YOLO.')) return;
-      const res = await fetch('/api/jobs/' + jobId + '/cancel', {{method: 'POST'}});
-      const body = await res.json().catch(() => ({{}}));
-      if (!res.ok) {{ alert('No se pudo cancelar: ' + (body.message || JSON.stringify(body))); return; }}
-      alert('Entrenamiento cancelado. El backend se reiniciará automáticamente.');
-      setTimeout(() => location.reload(), 2500);
-      }});
+
+    async function selectJob(job) {{
+      selectedJobId.value = job.id;
+      try {{
+        const res = await fetch('/api/jobs/' + job.id);
+        selectedJob.value = await res.json();
+      }} catch (e) {{
+        selectedJob.value = job;
+      }}
     }}
-    async function loadJob(jobId) {{
-      const res = await fetch('/api/jobs/' + jobId);
-      const job = await res.json();
-      selectedJobStatus = job.status;
-      document.getElementById('job-detail').textContent = JSON.stringify(job, null, 2);
-      document.getElementById('job-message').textContent = job.message || '';
-      document.getElementById('job-phase').textContent = job.phase || job.status || '';
-      setDatasetStatus(job.dataset);
-      const latest = (job.metrics && job.metrics.latest) || {{}};
-      const rows = (job.metrics && job.metrics.rows) || [];
-      const summary = (job.metrics && job.metrics.summary) || {{}};
-      const epochEl = document.querySelector(`[data-job-epoch='${{job.id}}']`);
-      if (epochEl && job.progress) epochEl.textContent = `Época ${{job.progress.current_epoch}}/${{job.progress.total_epochs}}`;
-      const bestEl = document.querySelector(`[data-job-best='${{job.id}}']`);
-      const bestEpoch = summary.best_epoch;
-      const bestMetric = Number(summary.best_metric);
-      if (bestEl) bestEl.textContent = bestEpoch === null || bestEpoch === undefined
-        ? 'Best n/d'
-        : (Number.isFinite(bestMetric) ? `Best época ${{bestEpoch}} · mAP50-95 ${{bestMetric.toFixed(4)}}` : `Best época ${{bestEpoch}}`);
-      const errorBox = document.getElementById('job-error');
-      if (job.error) {{ errorBox.style.display = 'block'; errorBox.textContent = 'Error: ' + job.error; }}
-      else {{ errorBox.style.display = 'none'; errorBox.textContent = ''; }}
-      document.getElementById('metrics-body').innerHTML = renderMetricCells(latest, 'Sin metricas todavia. Aparecen cuando Ultralytics escribe results.csv.');
-      document.getElementById('best-body').innerHTML = Object.keys(summary).length
-        ? [
-            ['Best existe', summary.best_exists], ['Best path', summary.best_path], ['Best mAP50-95', summary.best_metric],
-            ['Best epoch', summary.best_epoch], ['Epoch actual', summary.current_epoch],
-            ['Epochs sin mejora', summary.epochs_without_improvement], ['Paciencia restante', summary.patience_remaining]
-          ].map(([label, value]) => `<tr><td>${{label}}</td><td>${{value ?? ''}}</td></tr>`).join('')
-        : `<tr><td colspan='2' class='empty'>Sin información de best/paciencia todavía.</td></tr>`;
-      document.getElementById('charts').innerHTML = renderCharts(rows);
+
+    function fmtSize(bytes) {{
+      if (!bytes) return '—';
+      if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+      if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return bytes + ' B';
     }}
-    setInterval(() => {{
-      if (selectedJobId && ['running', 'queued'].includes(selectedJobStatus)) loadJob(selectedJobId);
-      updateDurations();
-      refreshJobList();
-    }}, 1000);
-    async function refreshJobList() {{
-      const res = await fetch('/api/jobs-fragment');
-      if (!res.ok) return;
-      document.getElementById('job-list').innerHTML = await res.text();
-      bindJobEvents();
-      updateDurations();
+
+    function fmtDate(ts) {{
+      if (!ts) return '—';
+      try {{
+        const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+        return d.toLocaleString('es-AR', {{ day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }});
+      }} catch(e) {{ return String(ts); }}
     }}
-    function fmt(seconds) {{
-      seconds = Math.max(Math.floor(seconds || 0), 0);
-      const d = Math.floor(seconds / 86400); seconds %= 86400;
-      const h = Math.floor(seconds / 3600); seconds %= 3600;
-      const m = Math.floor(seconds / 60); const s = seconds % 60;
-      return `${{d ? d + 'D ' : ''}}${{(d || h) ? h + 'H ' : ''}}${{(d || h || m) ? m + 'M ' : ''}}${{s}}S`;
+
+    async function deleteJob(id) {{
+      const res = await fetch('/api/jobs/' + id, {{ method: 'DELETE' }});
+      if (res.ok) {{
+        if (selectedJobId.value === id) {{ selectedJobId.value = null; selectedJob.value = null; }}
+        await fetchJobs();
+      }}
     }}
-    function updateDurations() {{
-      const now = Date.now() / 1000;
-      document.querySelectorAll('.duration').forEach(el => {{
-        const start = Number(el.dataset.start || 0);
-        const finished = Number(el.dataset.finished || 0);
-        if (start) el.textContent = fmt((finished || now) - start);
-      }});
+
+    function useForInference(path) {{
+      inferenceModelPath.value = path;
+      tab.value = 'inferencia';
+      applyInferenceModel();
     }}
-    function renderCharts(rows) {{
-      if (!rows.length) return `<div class='empty'>Los gráficos aparecen cuando exista results.csv para el job seleccionado.</div>`;
-      return [
-        ['metrics/mAP50-95(B)', 'mAP50-95', '#70e000'], ['metrics/mAP50(B)', 'mAP50', '#4cc9f0'],
-        ['train/box_loss', 'Train box loss', '#ffd166'], ['val/box_loss', 'Val box loss', '#ff5d73']
-      ].map(([key, title, color]) => chart(rows, key, title, color)).join('');
+
+    function patiencePct(job) {{
+      const s = ((job && job.metrics) ? job.metrics.summary : null) || {{}};
+      if (!s.patience) return 0;
+      return Math.round(((s.epochs_without_improvement || 0) / s.patience) * 100);
     }}
-    function chart(rows, key, title, color) {{
-      const values = rows.map(row => Number(row[key])).filter(Number.isFinite);
-      if (values.length < 2) return `<div class='chart empty'>Sin datos para ${{title}}</div>`;
-      const min = Math.min(...values), max = Math.max(...values), span = Math.max(max - min, 1e-9);
-      const points = values.map((value, i) => {{
-        const x = 26 + i * ((560 - 52) / (values.length - 1));
-        const y = 154 - ((value - min) / span) * 128;
-        return `${{x.toFixed(1)}},${{y.toFixed(1)}}`;
+
+    function patienceColor(job) {{
+      const pct = patiencePct(job);
+      if (pct >= 80) return 'error';
+      if (pct >= 50) return 'warning';
+      return 'success';
+    }}
+
+    const metricLabels = [
+      ['metrics/mAP50-95(B)', 'mAP50-95'],
+      ['metrics/mAP50(B)', 'mAP50'],
+      ['metrics/precision(B)', 'Precisión'],
+      ['metrics/recall(B)', 'Recall'],
+      ['train/box_loss', 'Train box loss'],
+      ['train/cls_loss', 'Train cls loss'],
+      ['train/dfl_loss', 'Train dfl loss'],
+      ['val/box_loss', 'Val box loss'],
+      ['val/cls_loss', 'Val cls loss'],
+      ['val/dfl_loss', 'Val dfl loss'],
+    ];
+
+    function svgChart(rows, key, title, color) {{
+      const W = 560, H = 180, PAD = 26;
+      const values = rows.map(r => {{
+        const v = parseFloat(r[key]);
+        return isNaN(v) ? null : v;
+      }}).filter(v => v !== null);
+      if (values.length < 2) return '<div style="opacity:0.4;text-align:center;padding:24px 0">'
+        + '<span style="font-size:12px;color:rgba(255,255,255,.4)">Sin datos — ' + title + '</span></div>';
+      const minV = Math.min(...values), maxV = Math.max(...values);
+      const span = Math.max(maxV - minV, 1e-9);
+      const pts = values.map((v, i) => {{
+        const x = PAD + i * ((W - PAD * 2) / (values.length - 1));
+        const y = H - PAD - ((v - minV) / span) * (H - PAD * 2);
+        return x.toFixed(1) + ',' + y.toFixed(1);
       }}).join(' ');
-      const tips = {{
-        'metrics/mAP50-95(B)': 'mAP50-95\\nMide la calidad promedio de detección con criterios estrictos de solapamiento.\\nMás alto es mejor.\\n0.50 es aceptable, 0.70+ suele ser bueno, 0.90+ es excelente si el dataset es representativo.',
-        'metrics/mAP50(B)': 'mAP50\\nMide detecciones correctas con un criterio de solapamiento más permisivo.\\nMás alto es mejor.\\nSirve para ver si el modelo encuentra los objetos, pero puede ser optimista frente a mAP50-95.',
-        'train/box_loss': 'Train box loss\\nError de localización de cajas en el conjunto de entrenamiento.\\nMás bajo es mejor.\\nDebe tender a bajar; si baja mucho y la validación empeora puede haber sobreajuste.',
-        'val/box_loss': 'Val box loss\\nError de localización de cajas en validación.\\nMás bajo es mejor.\\nEs más importante que train loss para saber si generaliza. Si sube mientras train baja, puede haber sobreajuste.'
-      }};
-      return `<div class='chart'><div class='chart-head'><strong>${{title}} <span class='help' data-tip='${{tips[key] || ''}}'>?</span></strong><span>último: ${{values.at(-1).toFixed(4)}}</span></div><svg viewBox='0 0 560 180'><line x1='26' y1='154' x2='534' y2='154' class='axis'/><line x1='26' y1='26' x2='26' y2='154' class='axis'/><polyline points='${{points}}' fill='none' stroke='${{color}}' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/></svg><div class='chart-scale'><span>min ${{min.toFixed(4)}}</span><span>max ${{max.toFixed(4)}}</span></div></div>`;
+      const latest = values[values.length - 1];
+      return '<div class="chart-wrap">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
+        + '<span style="font-size:11px;font-weight:600;color:rgba(255,255,255,.7)">' + title + '</span>'
+        + '<span style="font-size:11px;color:rgba(255,255,255,.5)">último: ' + latest.toFixed(4) + '</span>'
+        + '</div>'
+        + '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:130px;display:block">'
+        + '<line x1="' + PAD + '" y1="' + (H-PAD) + '" x2="' + (W-PAD) + '" y2="' + (H-PAD) + '" stroke="rgba(255,255,255,.1)" stroke-width="1"/>'
+        + '<line x1="' + PAD + '" y1="' + PAD + '" x2="' + PAD + '" y2="' + (H-PAD) + '" stroke="rgba(255,255,255,.1)" stroke-width="1"/>'
+        + '<polyline points="' + pts + '" fill="none" stroke="' + color + '" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>'
+        + '</svg>'
+        + '<div style="display:flex;justify-content:space-between">'
+        + '<span style="font-size:10px;color:rgba(255,255,255,.3)">min ' + minV.toFixed(4) + '</span>'
+        + '<span style="font-size:10px;color:rgba(255,255,255,.3)">max ' + maxV.toFixed(4) + '</span>'
+        + '</div></div>';
     }}
-    trainForm.addEventListener('submit', async (event) => {{
-      event.preventDefault();
-      const notice = document.getElementById('train-notice');
-      const data = Object.fromEntries(new FormData(event.currentTarget).entries());
-      data.project = Number(data.project);
-      data.epochs = Number(data.epochs);
-      data.imgsz = Number(data.imgsz);
-      data.batch = Number(data.batch);
-      data.patience = Number(data.patience);
-      data.workers = Number(data.workers);
-      data.train_percent = Number(data.train_percent);
-      data.lr0 = Number(data.lr0);
-      data.weight_decay = Number(data.weight_decay);
-      data.cos_lr = data.cos_lr === 'true';
-      saveTrainForm();
-      notice.textContent = `Enviando entrenamiento: ${{data.epochs}} epochs, paciencia ${{data.patience}}, batch ${{data.batch}}, workers ${{data.workers}}, lr0 ${{data.lr0}}, wd ${{data.weight_decay}}, cos_lr ${{data.cos_lr ? 'si' : 'no'}}, split ${{data.train_percent}}/${{100 - data.train_percent}}...`;
-      const res = await fetch('/train', {{
-        method: 'POST',
-        headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify(data)
-      }});
-      const body = await res.json();
-      if (!res.ok) {{
-        notice.textContent = 'Error: ' + JSON.stringify(body);
-        return;
-      }}
-      if (body.status === 'busy') {{
-        notice.textContent = 'Ya hay un entrenamiento corriendo. Configuración solicitada: ' + JSON.stringify(body.requested_train_config);
-        return;
-      }}
-      notice.textContent = 'Job creado: ' + body.job_id + '. Refrescando...';
-      selectedJobId = body.job_id;
-      await loadJob(selectedJobId);
-      await refreshJobList();
-      notice.textContent = 'Job creado y seleccionado: ' + body.job_id;
+
+    const chartsHtml = computed(() => {{
+      const job = selectedJob.value;
+      if (!job || !job.metrics || !job.metrics.rows || job.metrics.rows.length < 2) return '';
+      const rows = job.metrics.rows;
+      const defs = [
+        {{ key: 'metrics/mAP50-95(B)', title: 'mAP50-95', color: '#4CAF50' }},
+        {{ key: 'metrics/mAP50(B)', title: 'mAP50', color: '#1976D2' }},
+        {{ key: 'train/box_loss', title: 'Train box loss', color: '#FF9800' }},
+        {{ key: 'val/box_loss', title: 'Val box loss', color: '#ef5350' }},
+      ];
+      return defs.map(c => svgChart(rows, c.key, c.title, c.color)).join('');
     }});
-    document.getElementById('active-model-form').addEventListener('submit', async (event) => {{
-      event.preventDefault();
-      const notice = document.getElementById('active-model-notice');
-      const data = Object.fromEntries(new FormData(event.currentTarget).entries());
-      notice.textContent = 'Cambiando modelo activo...';
-      const res = await fetch('/api/active-model', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(data)}});
-      const body = await res.json();
-      notice.textContent = res.ok ? 'Modelo activo: ' + body.active_model_path : 'Error: ' + JSON.stringify(body);
-      if (res.ok) setTimeout(() => location.reload(), 900);
+
+    let pollTimer = null;
+    onMounted(async () => {{
+      await Promise.all([fetchJobs(), fetchModels(), fetchStatus()]);
+      if (jobs.value.length > 0) selectJob(jobs.value[0]);
+      pollTimer = setInterval(async () => {{
+        await fetchJobs();
+        if (selectedJobId.value) {{
+          try {{
+            const res = await fetch('/api/jobs/' + selectedJobId.value);
+            if (res.ok) selectedJob.value = await res.json();
+          }} catch(e) {{}}
+        }}
+        if (isRunning.value) await fetchModels();
+      }}, 2000);
     }});
-    document.querySelectorAll('button[data-model]').forEach(btn => btn.addEventListener('click', async () => {{
-      const res = await fetch('/api/models');
-      const body = await res.json();
-      const model = body.models.find(item => item.name === btn.dataset.model);
-      if (!model || !model.metadata) {{
-        document.getElementById('job-message').textContent = 'Este modelo no tiene métricas guardadas.';
-        return;
-      }}
-      const job = model.metadata;
-      selectedJobId = null;
-      selectedJobStatus = job.status;
-      document.getElementById('job-detail').textContent = JSON.stringify(job, null, 2);
-      document.getElementById('job-message').textContent = 'Métricas guardadas para ' + model.name;
-      document.getElementById('job-phase').textContent = 'modelo guardado';
-      setDatasetStatus(job.dataset);
-      const rows = (job.metrics && job.metrics.rows) || [];
-      const latest = (job.metrics && job.metrics.latest) || {{}};
-      const summary = (job.metrics && job.metrics.summary) || {{}};
-      document.getElementById('metrics-body').innerHTML = renderMetricCells(latest, 'Sin metricas guardadas.');
-      document.getElementById('best-body').innerHTML = Object.keys(summary).length ? [
-        ['Best existe', summary.best_exists], ['Best path', summary.best_path], ['Best mAP50-95', summary.best_metric], ['Best epoch', summary.best_epoch], ['Epoch actual', summary.current_epoch], ['Epochs sin mejora', summary.epochs_without_improvement], ['Paciencia restante', summary.patience_remaining]
-      ].map(([label, value]) => `<tr><td>${{label}}</td><td>${{value ?? ''}}</td></tr>`).join('') : `<tr><td colspan='2' class='empty'>Sin información guardada.</td></tr>`;
-      document.getElementById('charts').innerHTML = renderCharts(rows);
-    }}));
-    updateDurations();
-  </script>
+    onUnmounted(() => clearInterval(pollTimer));
+
+    return {{
+      tab, jobs, selectedJobId, selectedJob, activeModelName,
+      isRunning, statusColor, statusIcon, fmtDuration, fmtDate, selectJob,
+      availableModels, inferenceModelPath, activeLabels,
+      confidence, ultralytics, applyingModel, inferenceMsg, inferenceMsgType,
+      applyInferenceModel,
+      trainForm, trainProjects, trainDevices, trainModels,
+      externalModelFile, uploadingModel, uploadMsg, uploadOk,
+      startingTrain, startTrainMsg, startTrainOk, runningJob,
+      epochPct, uploadExternalModel, startTraining, cancelJob,
+      deleteJob, useForInference, patiencePct, patienceColor,
+      metricLabels, chartsHtml,
+      modelsTable, fmtSize,
+    }};
+  }},
+}}).use(vuetify).component('field-label', FieldLabel).mount('#app');
+</script>
 </body>
-</html>
-"""
+</html>"""
