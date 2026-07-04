@@ -1026,6 +1026,8 @@ def index():
         "projects": label_studio_projects(),
         "devices": gpu_status().get("cuda_devices", []),
         "currentModelName": Path(state["model_path"]).name,
+        "currentModelPath": state["model_path"],
+        "confidenceThreshold": CONFIDENCE_THRESHOLD,
         "ultralytics": ULTRALYTICS_VERSION,
         "defaults": {
             "epochs": TRAIN_EPOCHS,
@@ -1110,9 +1112,132 @@ def index():
 
           <!-- ═════════════════ TAB: INFERENCIA ═════════════════ -->
           <v-tabs-window-item value="inferencia">
-            <v-alert type="info" variant="tonal">
-              Tab Inferencia — próxima fase
-            </v-alert>
+            <v-row>
+
+              <!-- Modelo activo -->
+              <v-col cols="12" md="7">
+                <v-card variant="outlined" class="mb-4">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2" color="primary">mdi-brain</v-icon>
+                    Modelo activo para inferencia
+                  </v-card-title>
+                  <v-card-text>
+                    <v-select
+                      v-model="inferenceModelPath"
+                      :items="availableModels"
+                      item-title="label"
+                      item-value="path"
+                      label="Modelo"
+                      variant="outlined"
+                      density="compact"
+                      class="mb-3"
+                    ></v-select>
+                    <div class="d-flex align-center ga-2 mb-4 flex-wrap">
+                      <v-chip color="primary" size="small" prepend-icon="mdi-tune-variant">
+                        Confianza: {{{{ (confidence * 100).toFixed(0) }}}}%
+                      </v-chip>
+                      <v-chip
+                        v-for="label in activeLabels" :key="label"
+                        color="secondary" size="small" variant="tonal"
+                        prepend-icon="mdi-tag-outline"
+                      >
+                        {{{{ label }}}}
+                      </v-chip>
+                      <span v-if="activeLabels.length === 0" class="text-caption text-medium-emphasis">
+                        Sin etiquetas cargadas — Label Studio aún no hizo setup
+                      </span>
+                    </div>
+                    <v-btn
+                      color="primary"
+                      variant="flat"
+                      :loading="applyingModel"
+                      :disabled="!inferenceModelPath"
+                      @click="applyInferenceModel"
+                      prepend-icon="mdi-check"
+                    >
+                      Aplicar modelo
+                    </v-btn>
+                    <v-alert
+                      v-if="inferenceMsg"
+                      :type="inferenceMsgType"
+                      variant="tonal"
+                      class="mt-3"
+                      density="compact"
+                    >
+                      {{{{ inferenceMsg }}}}
+                    </v-alert>
+                  </v-card-text>
+                </v-card>
+              </v-col>
+
+              <!-- Info de conexión -->
+              <v-col cols="12" md="5">
+                <v-card variant="outlined" class="mb-4">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2" color="success">mdi-api</v-icon>
+                    Conexión Label Studio
+                  </v-card-title>
+                  <v-card-text>
+                    <v-table density="compact">
+                      <tbody>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis" style="width:110px">Predicción</td>
+                          <td><code class="text-caption">POST /predict</code></td>
+                        </tr>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis">Setup</td>
+                          <td><code class="text-caption">POST /setup</code></td>
+                        </tr>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis">Health</td>
+                          <td><code class="text-caption">GET /health</code></td>
+                        </tr>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis">Confianza</td>
+                          <td class="text-caption">{{{{ (confidence * 100).toFixed(0) }}}}% (env CONFIDENCE_THRESHOLD)</td>
+                        </tr>
+                        <tr>
+                          <td class="text-caption text-medium-emphasis">Ultralytics</td>
+                          <td class="text-caption">{{{{ ultralytics }}}}</td>
+                        </tr>
+                      </tbody>
+                    </v-table>
+                  </v-card-text>
+                </v-card>
+
+                <v-card variant="outlined">
+                  <v-card-title class="text-body-1 font-weight-bold pt-4 pb-1">
+                    <v-icon class="mr-2" color="warning">mdi-folder-multiple</v-icon>
+                    Modelos disponibles
+                  </v-card-title>
+                  <v-card-text class="pa-0">
+                    <v-list density="compact" class="pa-0">
+                      <v-list-item
+                        v-for="m in availableModels" :key="m.path"
+                        :subtitle="m.source"
+                        density="compact"
+                      >
+                        <template v-slot:prepend>
+                          <v-icon size="16" :color="m.active ? 'primary' : 'grey'">
+                            {{{{ m.active ? 'mdi-check-circle' : 'mdi-circle-outline' }}}}
+                          </v-icon>
+                        </template>
+                        <v-list-item-title class="text-caption">{{{{ m.label }}}}</v-list-item-title>
+                        <template v-slot:append>
+                          <v-chip v-if="m.active" size="x-small" color="primary">activo</v-chip>
+                        </template>
+                      </v-list-item>
+                      <v-list-item v-if="availableModels.length === 0">
+                        <v-list-item-title class="text-caption text-medium-emphasis">
+                          Sin modelos disponibles
+                        </v-list-item-title>
+                      </v-list-item>
+                    </v-list>
+                  </v-card-text>
+                </v-card>
+              </v-col>
+
+            </v-row>
           </v-tabs-window-item>
 
           <!-- ═════════════════ TAB: ENTRENAR ═════════════════ -->
@@ -1216,6 +1341,16 @@ createApp({{
     const selectedJob = ref(null);
     const activeModelName = ref(INITIAL_DATA.currentModelName || '');
 
+    // ── Inferencia ──
+    const availableModels = ref([]);
+    const inferenceModelPath = ref(INITIAL_DATA.currentModelPath || '');
+    const activeLabels = ref([]);
+    const confidence = ref(INITIAL_DATA.confidenceThreshold || 0.25);
+    const ultralytics = ref(INITIAL_DATA.ultralytics || '');
+    const applyingModel = ref(false);
+    const inferenceMsg = ref('');
+    const inferenceMsgType = ref('success');
+
     const isRunning = computed(() =>
       jobs.value.some(j => j.status === 'running' || j.status === 'queued')
     );
@@ -1231,6 +1366,62 @@ createApp({{
       const h = Math.floor(secs / 3600); secs %= 3600;
       const m = Math.floor(secs / 60); const s = secs % 60;
       return (h ? h + 'h ' : '') + (h || m ? m + 'm ' : '') + s + 's';
+    }}
+
+    async function fetchModels() {{
+      try {{
+        const res = await fetch('/api/models');
+        const data = await res.json();
+        const opts = data.available_models || [];
+        availableModels.value = opts.map(m => ({{
+          ...m,
+          label: m.name + (m.source === 'entrenado' && m.project ? ' [proy ' + m.project + ']' : '') + (m.active ? ' ✓' : ''),
+        }}));
+        const active = opts.find(m => m.active);
+        if (active) {{
+          activeModelName.value = active.name;
+          inferenceModelPath.value = active.path;
+        }}
+      }} catch (e) {{
+        console.warn('Error fetching models', e);
+      }}
+    }}
+
+    async function fetchStatus() {{
+      try {{
+        const res = await fetch('/status');
+        const data = await res.json();
+        if (Array.isArray(data.labels)) activeLabels.value = data.labels;
+      }} catch (e) {{
+        console.warn('Error fetching status', e);
+      }}
+    }}
+
+    async function applyInferenceModel() {{
+      applyingModel.value = true;
+      inferenceMsg.value = '';
+      try {{
+        const res = await fetch('/api/active-model', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ model_path: inferenceModelPath.value }}),
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          inferenceMsg.value = 'Modelo activado: ' + (data.active_model_path || inferenceModelPath.value);
+          inferenceMsgType.value = 'success';
+          activeModelName.value = inferenceModelPath.value.split('/').pop();
+          await fetchModels();
+        }} else {{
+          inferenceMsg.value = 'Error: ' + (data.message || JSON.stringify(data));
+          inferenceMsgType.value = 'error';
+        }}
+      }} catch (e) {{
+        inferenceMsg.value = 'Error de red: ' + e.message;
+        inferenceMsgType.value = 'error';
+      }} finally {{
+        applyingModel.value = false;
+      }}
     }}
 
     async function fetchJobs() {{
@@ -1259,15 +1450,21 @@ createApp({{
 
     let pollTimer = null;
     onMounted(async () => {{
-      await fetchJobs();
+      await Promise.all([fetchJobs(), fetchModels(), fetchStatus()]);
       if (jobs.value.length > 0) selectJob(jobs.value[0]);
-      pollTimer = setInterval(fetchJobs, 2000);
+      pollTimer = setInterval(async () => {{
+        await fetchJobs();
+        if (isRunning.value) await fetchModels();
+      }}, 2000);
     }});
     onUnmounted(() => clearInterval(pollTimer));
 
     return {{
       tab, jobs, selectedJobId, selectedJob, activeModelName,
       isRunning, statusColor, statusIcon, fmtDuration, selectJob,
+      availableModels, inferenceModelPath, activeLabels,
+      confidence, ultralytics, applyingModel, inferenceMsg, inferenceMsgType,
+      applyInferenceModel,
     }};
   }},
 }}).use(vuetify).mount('#app');
