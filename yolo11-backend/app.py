@@ -335,7 +335,8 @@ def label_studio_projects():
             if project_id is None:
                 continue
             title = item.get("title") or item.get("name") or f"Proyecto {project_id}"
-            projects.append({"id": project_id, "title": str(title)})
+            task_count = item.get("task_number") or item.get("num_tasks") or item.get("task_count") or 0
+            projects.append({"id": project_id, "title": str(title), "task_count": task_count})
         return sorted(projects, key=lambda item: str(item["title"]).lower())
     except Exception as exc:
         app.logger.warning("Could not load Label Studio projects: %s", exc)
@@ -1539,25 +1540,23 @@ def index():
 
           <!-- ═════════════════ TAB: HISTORIAL ═════════════════ -->
           <v-tabs-window-item value="historial">
-            <v-row v-if="jobs.length === 0">
-              <v-col>
-                <v-alert type="info" variant="tonal" class="mt-2">
-                  Todavía no hay jobs de entrenamiento.
-                </v-alert>
-              </v-col>
-            </v-row>
+            <v-alert v-if="jobs.length === 0" type="info" variant="tonal" class="mt-2">
+              Todavía no hay jobs de entrenamiento.
+            </v-alert>
             <v-row v-else>
-              <v-col cols="12" md="4">
+
+              <!-- ── Lista de jobs (izquierda) ── -->
+              <v-col cols="12" md="4" lg="3">
                 <v-list density="compact" nav>
                   <v-list-item
                     v-for="job in jobs" :key="job.id"
                     :active="selectedJobId === job.id"
                     @click="selectJob(job)"
                     rounded="lg"
-                    class="mb-1"
+                    class="mb-1 pa-2"
                   >
                     <template v-slot:prepend>
-                      <v-icon :color="statusColor(job.status)" size="18">
+                      <v-icon :color="statusColor(job.status)" size="18" class="mr-2">
                         {{{{ statusIcon(job.status) }}}}
                       </v-icon>
                     </template>
@@ -1565,26 +1564,180 @@ def index():
                       Proyecto {{{{ job.project }}}}
                     </v-list-item-title>
                     <v-list-item-subtitle class="text-caption">
-                      {{{{ job.status }}}} · {{{{ fmtDuration(job.elapsed_seconds) }}}}
+                      <v-chip :color="statusColor(job.status)" size="x-small" variant="tonal" class="mr-1">
+                        {{{{ job.status }}}}
+                      </v-chip>
+                      {{{{ fmtDuration(job.elapsed_seconds) }}}}
                     </v-list-item-subtitle>
+                    <v-list-item-subtitle v-if="job.metrics && job.metrics.summary && job.metrics.summary.best_metric != null" class="text-caption mt-1">
+                      Best ep.{{{{ job.metrics.summary.best_epoch }}}} · mAP {{{{ Number(job.metrics.summary.best_metric).toFixed(4) }}}}
+                    </v-list-item-subtitle>
+                    <template v-slot:append>
+                      <v-btn
+                        icon size="x-small" variant="text" color="error"
+                        :disabled="job.status === 'running'"
+                        @click.stop="deleteJob(job.id)"
+                      >
+                        <v-icon size="16">mdi-delete-outline</v-icon>
+                      </v-btn>
+                    </template>
                   </v-list-item>
                 </v-list>
               </v-col>
-              <v-col cols="12" md="8">
-                <v-card v-if="selectedJob" variant="outlined">
-                  <v-card-title class="text-body-1">
-                    Job {{{{ selectedJob.id ? selectedJob.id.substring(0,8) : '' }}}}
-                  </v-card-title>
-                  <v-card-subtitle>{{{{ selectedJob.status }}}}</v-card-subtitle>
-                  <v-card-text>
-                    <div class="text-caption text-medium-emphasis">
-                      Historial completo — próxima fase
-                    </div>
-                  </v-card-text>
-                </v-card>
-                <v-alert v-else type="info" variant="tonal">
+
+              <!-- ── Detalle del job (derecha) ── -->
+              <v-col cols="12" md="8" lg="9">
+                <v-alert v-if="!selectedJob" type="info" variant="tonal">
                   Seleccioná un job para ver el detalle.
                 </v-alert>
+
+                <div v-else>
+
+                  <!-- Resumen -->
+                  <v-card variant="outlined" class="mb-3">
+                    <v-card-title class="text-body-2 font-weight-bold pt-3 pb-1 d-flex align-center justify-space-between">
+                      <span>
+                        <v-icon size="16" class="mr-1" color="primary">mdi-information-outline</v-icon>
+                        Resumen · job {{{{ selectedJob.id ? selectedJob.id.substring(0,8) : '' }}}}
+                      </span>
+                      <div class="d-flex ga-1">
+                        <v-btn
+                          v-if="selectedJob.trained_model"
+                          size="x-small" variant="tonal" color="success"
+                          prepend-icon="mdi-download"
+                          :href="'/download/models/' + selectedJob.trained_model.split('/').pop()"
+                        >Descargar</v-btn>
+                        <v-btn
+                          v-if="selectedJob.trained_model"
+                          size="x-small" variant="tonal" color="primary"
+                          prepend-icon="mdi-play"
+                          @click="useForInference(selectedJob.trained_model)"
+                        >Usar para inferencia</v-btn>
+                      </div>
+                    </v-card-title>
+                    <v-card-text class="pa-0">
+                      <v-table density="compact">
+                        <tbody>
+                          <tr>
+                            <td class="text-caption text-medium-emphasis" style="width:140px;padding:6px 16px">Status</td>
+                            <td style="padding:6px 16px">
+                              <v-chip :color="statusColor(selectedJob.status)" size="x-small" variant="tonal">
+                                {{{{ selectedJob.status }}}}
+                              </v-chip>
+                            </td>
+                          </tr>
+                          <tr>
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Proyecto LS</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.project }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.train_config && selectedJob.train_config.model_path">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Modelo base</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.train_config.model_path.split('/').pop() }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.train_config && selectedJob.train_config.device">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Device</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.train_config.device }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.dataset">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Dataset</td>
+                            <td class="text-caption" style="padding:6px 16px">
+                              {{{{ selectedJob.dataset.train_images || '?' }}}} train /
+                              {{{{ selectedJob.dataset.val_images || '?' }}}} val
+                              <span v-if="selectedJob.dataset.train_percent"> ({{{{ selectedJob.dataset.train_percent }}}}% train)</span>
+                            </td>
+                          </tr>
+                          <tr v-if="selectedJob.started_at">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Iniciado</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ fmtDate(selectedJob.started_at) }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.finished_at">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Finalizado</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ fmtDate(selectedJob.finished_at) }}}}</td>
+                          </tr>
+                          <tr>
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Duración</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ fmtDuration(selectedJob.elapsed_seconds) }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.trained_model">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Modelo resultado</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.trained_model.split('/').pop() }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.message">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Mensaje</td>
+                            <td class="text-caption" style="padding:6px 16px">{{{{ selectedJob.message }}}}</td>
+                          </tr>
+                          <tr v-if="selectedJob.error">
+                            <td class="text-caption text-medium-emphasis" style="padding:6px 16px">Error</td>
+                            <td class="text-caption text-error" style="padding:6px 16px">{{{{ selectedJob.error }}}}</td>
+                          </tr>
+                        </tbody>
+                      </v-table>
+                    </v-card-text>
+                  </v-card>
+
+                  <!-- Best y paciencia -->
+                  <v-card v-if="selectedJob.metrics && selectedJob.metrics.summary && Object.keys(selectedJob.metrics.summary).length" variant="outlined" class="mb-3">
+                    <v-card-title class="text-body-2 font-weight-bold pt-3 pb-2">
+                      <v-icon size="16" class="mr-1" color="success">mdi-trophy-outline</v-icon>
+                      Best y paciencia
+                    </v-card-title>
+                    <v-card-text>
+                      <div class="d-flex ga-2 flex-wrap mb-3">
+                        <v-chip color="success" size="small" variant="tonal" prepend-icon="mdi-star">
+                          Best epoch: {{{{ selectedJob.metrics.summary.best_epoch != null ? selectedJob.metrics.summary.best_epoch : '—' }}}}
+                        </v-chip>
+                        <v-chip color="success" size="small" variant="tonal" prepend-icon="mdi-chart-line">
+                          Best mAP50-95: {{{{ selectedJob.metrics.summary.best_metric != null ? Number(selectedJob.metrics.summary.best_metric).toFixed(4) : '—' }}}}
+                        </v-chip>
+                        <v-chip size="small" variant="tonal">
+                          Epoch actual: {{{{ selectedJob.metrics.summary.current_epoch != null ? selectedJob.metrics.summary.current_epoch : '—' }}}}
+                        </v-chip>
+                        <v-chip :color="patienceColor(selectedJob)" size="small" variant="tonal">
+                          Sin mejora: {{{{ selectedJob.metrics.summary.epochs_without_improvement != null ? selectedJob.metrics.summary.epochs_without_improvement : '—' }}}} / {{{{ selectedJob.metrics.summary.patience }}}}
+                        </v-chip>
+                      </div>
+                      <div class="text-caption text-medium-emphasis mb-1">Paciencia consumida</div>
+                      <v-progress-linear
+                        :model-value="patiencePct(selectedJob)"
+                        :color="patienceColor(selectedJob)"
+                        height="8"
+                        rounded
+                      ></v-progress-linear>
+                    </v-card-text>
+                  </v-card>
+
+                  <!-- Métricas YOLO (14 valores) -->
+                  <v-card v-if="selectedJob.metrics && selectedJob.metrics.latest && Object.keys(selectedJob.metrics.latest).length" variant="outlined" class="mb-3">
+                    <v-card-title class="text-body-2 font-weight-bold pt-3 pb-2">
+                      <v-icon size="16" class="mr-1" color="warning">mdi-gauge</v-icon>
+                      Métricas YOLO — última época
+                    </v-card-title>
+                    <v-card-text>
+                      <div class="d-flex ga-2 flex-wrap">
+                        <v-chip
+                          v-for="[key, label] in metricLabels" :key="key"
+                          :color="key === 'metrics/mAP50-95(B)' ? 'success' : undefined"
+                          :size="key === 'metrics/mAP50-95(B)' ? 'default' : 'small'"
+                          :variant="key === 'metrics/mAP50-95(B)' ? 'flat' : 'tonal'"
+                        >
+                          {{{{ label }}}}: {{{{ selectedJob.metrics.latest[key] || '—' }}}}
+                        </v-chip>
+                      </div>
+                    </v-card-text>
+                  </v-card>
+
+                  <!-- Curvas SVG -->
+                  <v-card v-if="selectedJob.metrics && selectedJob.metrics.rows && selectedJob.metrics.rows.length > 1" variant="outlined" class="mb-3">
+                    <v-card-title class="text-body-2 font-weight-bold pt-3 pb-2">
+                      <v-icon size="16" class="mr-1" color="info">mdi-chart-bell-curve-cumulative</v-icon>
+                      Curvas de entrenamiento
+                    </v-card-title>
+                    <v-card-text>
+                      <div class="chart-grid" v-html="chartsHtml"></div>
+                    </v-card-text>
+                  </v-card>
+
+                </div>
               </v-col>
             </v-row>
           </v-tabs-window-item>
@@ -1600,7 +1753,7 @@ def index():
 <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/vuetify@3/dist/vuetify.min.js"></script>
 <script>
-const {{ createApp, ref, computed, onMounted, onUnmounted }} = Vue;
+const {{ createApp, ref, computed, watch, onMounted, onUnmounted }} = Vue;
 const {{ createVuetify }} = Vuetify;
 
 // Componente reutilizable: label + tooltip de ayuda (igual que lpr-ocr-labeler)
@@ -1649,23 +1802,37 @@ createApp({{
     const activeModelName = ref(INITIAL_DATA.currentModelName || '');
 
     // ── Entrenar ──
+    const TRAIN_STORAGE_KEY = 'yolo11.trainForm';
+    function loadSavedForm() {{
+      try {{ return JSON.parse(localStorage.getItem(TRAIN_STORAGE_KEY) || 'null'); }}
+      catch {{ return null; }}
+    }}
+    function saveForm(form) {{
+      try {{ localStorage.setItem(TRAIN_STORAGE_KEY, JSON.stringify(form)); }} catch {{}}
+    }}
+    const _saved = loadSavedForm();
     const trainForm = ref({{
-      project: null,
-      model_path: '',
-      device: INITIAL_DATA.defaults.device || 'auto',
-      epochs: INITIAL_DATA.defaults.epochs,
-      imgsz: INITIAL_DATA.defaults.imgsz,
-      batch: INITIAL_DATA.defaults.batch,
-      patience: INITIAL_DATA.defaults.patience,
-      workers: INITIAL_DATA.defaults.workers,
-      lr0: INITIAL_DATA.defaults.lr0,
-      weight_decay: INITIAL_DATA.defaults.weightDecay,
-      cos_lr: INITIAL_DATA.defaults.cosLr,
-      train_percent: INITIAL_DATA.defaults.splitPercent,
+      project: _saved && _saved.project != null ? _saved.project : null,
+      model_path: (_saved && _saved.model_path) || '',
+      device: (_saved && _saved.device) || INITIAL_DATA.defaults.device || 'auto',
+      epochs: (_saved && _saved.epochs != null) ? _saved.epochs : INITIAL_DATA.defaults.epochs,
+      imgsz: (_saved && _saved.imgsz != null) ? _saved.imgsz : INITIAL_DATA.defaults.imgsz,
+      batch: (_saved && _saved.batch != null) ? _saved.batch : INITIAL_DATA.defaults.batch,
+      patience: (_saved && _saved.patience != null) ? _saved.patience : INITIAL_DATA.defaults.patience,
+      workers: (_saved && _saved.workers != null) ? _saved.workers : INITIAL_DATA.defaults.workers,
+      lr0: (_saved && _saved.lr0 != null) ? _saved.lr0 : INITIAL_DATA.defaults.lr0,
+      weight_decay: (_saved && _saved.weight_decay != null) ? _saved.weight_decay : INITIAL_DATA.defaults.weightDecay,
+      cos_lr: (_saved && _saved.cos_lr != null) ? _saved.cos_lr : INITIAL_DATA.defaults.cosLr,
+      train_percent: (_saved && _saved.train_percent != null) ? _saved.train_percent : INITIAL_DATA.defaults.splitPercent,
     }});
     const trainProjects = ref(
-      (INITIAL_DATA.projects || []).map(p => ({{ id: p.id, label: p.id + ' — ' + p.title }}))
+      (INITIAL_DATA.projects || []).map(p => ({{
+        id: p.id,
+        label: p.id + ' — ' + p.title + (p.task_count ? ' (' + p.task_count + ' imágenes)' : ''),
+      }}))
     );
+    watch(trainForm, (val) => saveForm(val), {{ deep: true }});
+
     const trainDevices = ref(
       ['auto', 'cpu'].concat((INITIAL_DATA.devices || []).map((name, i) => ({{ title: i + ' — ' + name, value: String(i) }})))
     );
@@ -1878,12 +2045,111 @@ createApp({{
       }}
     }}
 
+    function fmtDate(ts) {{
+      if (!ts) return '—';
+      try {{
+        const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+        return d.toLocaleString('es-AR', {{ day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }});
+      }} catch(e) {{ return String(ts); }}
+    }}
+
+    async function deleteJob(id) {{
+      const res = await fetch('/api/jobs/' + id, {{ method: 'DELETE' }});
+      if (res.ok) {{
+        if (selectedJobId.value === id) {{ selectedJobId.value = null; selectedJob.value = null; }}
+        await fetchJobs();
+      }}
+    }}
+
+    function useForInference(path) {{
+      inferenceModelPath.value = path;
+      tab.value = 'inferencia';
+      applyInferenceModel();
+    }}
+
+    function patiencePct(job) {{
+      const s = ((job && job.metrics) ? job.metrics.summary : null) || {{}};
+      if (!s.patience) return 0;
+      return Math.round(((s.epochs_without_improvement || 0) / s.patience) * 100);
+    }}
+
+    function patienceColor(job) {{
+      const pct = patiencePct(job);
+      if (pct >= 80) return 'error';
+      if (pct >= 50) return 'warning';
+      return 'success';
+    }}
+
+    const metricLabels = [
+      ['metrics/mAP50-95(B)', 'mAP50-95'],
+      ['metrics/mAP50(B)', 'mAP50'],
+      ['metrics/precision(B)', 'Precisión'],
+      ['metrics/recall(B)', 'Recall'],
+      ['train/box_loss', 'Train box loss'],
+      ['train/cls_loss', 'Train cls loss'],
+      ['train/dfl_loss', 'Train dfl loss'],
+      ['val/box_loss', 'Val box loss'],
+      ['val/cls_loss', 'Val cls loss'],
+      ['val/dfl_loss', 'Val dfl loss'],
+    ];
+
+    function svgChart(rows, key, title, color) {{
+      const W = 560, H = 180, PAD = 26;
+      const values = rows.map(r => {{
+        const v = parseFloat(r[key]);
+        return isNaN(v) ? null : v;
+      }}).filter(v => v !== null);
+      if (values.length < 2) return '<div style="opacity:0.4;text-align:center;padding:24px 0">'
+        + '<span style="font-size:12px;color:rgba(255,255,255,.4)">Sin datos — ' + title + '</span></div>';
+      const minV = Math.min(...values), maxV = Math.max(...values);
+      const span = Math.max(maxV - minV, 1e-9);
+      const pts = values.map((v, i) => {{
+        const x = PAD + i * ((W - PAD * 2) / (values.length - 1));
+        const y = H - PAD - ((v - minV) / span) * (H - PAD * 2);
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }}).join(' ');
+      const latest = values[values.length - 1];
+      return '<div class="chart-wrap">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
+        + '<span style="font-size:11px;font-weight:600;color:rgba(255,255,255,.7)">' + title + '</span>'
+        + '<span style="font-size:11px;color:rgba(255,255,255,.5)">último: ' + latest.toFixed(4) + '</span>'
+        + '</div>'
+        + '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:130px;display:block">'
+        + '<line x1="' + PAD + '" y1="' + (H-PAD) + '" x2="' + (W-PAD) + '" y2="' + (H-PAD) + '" stroke="rgba(255,255,255,.1)" stroke-width="1"/>'
+        + '<line x1="' + PAD + '" y1="' + PAD + '" x2="' + PAD + '" y2="' + (H-PAD) + '" stroke="rgba(255,255,255,.1)" stroke-width="1"/>'
+        + '<polyline points="' + pts + '" fill="none" stroke="' + color + '" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>'
+        + '</svg>'
+        + '<div style="display:flex;justify-content:space-between">'
+        + '<span style="font-size:10px;color:rgba(255,255,255,.3)">min ' + minV.toFixed(4) + '</span>'
+        + '<span style="font-size:10px;color:rgba(255,255,255,.3)">max ' + maxV.toFixed(4) + '</span>'
+        + '</div></div>';
+    }}
+
+    const chartsHtml = computed(() => {{
+      const job = selectedJob.value;
+      if (!job || !job.metrics || !job.metrics.rows || job.metrics.rows.length < 2) return '';
+      const rows = job.metrics.rows;
+      const defs = [
+        {{ key: 'metrics/mAP50-95(B)', title: 'mAP50-95', color: '#4CAF50' }},
+        {{ key: 'metrics/mAP50(B)', title: 'mAP50', color: '#1976D2' }},
+        {{ key: 'train/box_loss', title: 'Train box loss', color: '#FF9800' }},
+        {{ key: 'val/box_loss', title: 'Val box loss', color: '#ef5350' }},
+      ];
+      return defs.map(c => svgChart(rows, c.key, c.title, c.color)).join('');
+    }});
+
     let pollTimer = null;
     onMounted(async () => {{
       await Promise.all([fetchJobs(), fetchModels(), fetchStatus()]);
       if (jobs.value.length > 0) selectJob(jobs.value[0]);
       pollTimer = setInterval(async () => {{
         await fetchJobs();
+        if (selectedJobId.value) {{
+          try {{
+            const res = await fetch('/api/jobs/' + selectedJobId.value);
+            if (res.ok) selectedJob.value = await res.json();
+          }} catch(e) {{}}
+        }}
         if (isRunning.value) await fetchModels();
       }}, 2000);
     }});
@@ -1891,7 +2157,7 @@ createApp({{
 
     return {{
       tab, jobs, selectedJobId, selectedJob, activeModelName,
-      isRunning, statusColor, statusIcon, fmtDuration, selectJob,
+      isRunning, statusColor, statusIcon, fmtDuration, fmtDate, selectJob,
       availableModels, inferenceModelPath, activeLabels,
       confidence, ultralytics, applyingModel, inferenceMsg, inferenceMsgType,
       applyInferenceModel,
@@ -1899,6 +2165,8 @@ createApp({{
       externalModelFile, uploadingModel, uploadMsg, uploadOk,
       startingTrain, startTrainMsg, startTrainOk, runningJob,
       epochPct, uploadExternalModel, startTraining, cancelJob,
+      deleteJob, useForInference, patiencePct, patienceColor,
+      metricLabels, chartsHtml,
     }};
   }},
 }}).use(vuetify).component('field-label', FieldLabel).mount('#app');
