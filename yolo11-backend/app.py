@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -757,6 +758,121 @@ def model_map5095(model):
     return f"{value:.4f}" if isinstance(value, (int, float)) else "n/d"
 
 
+_YOLO_SIZE_RE = re.compile(r"(?:^|[-_])([nsmlx])$", re.IGNORECASE)
+
+
+def infer_yolo_size(base_model_path):
+    """Intenta deducir la talla (n/s/m/l/x) del nombre del modelo BASE usado
+    para entrenar (ej: 'yolo11n.pt' -> 'n', 'precintos-s.pt' -> 's'). No hay
+    un campo explícito de talla en este proyecto — se infiere del sufijo
+    convencional de Ultralytics/los modelos ya nombrados así en /models. Si
+    no matchea (nombre custom sin ese patrón), devuelve None y el llamador
+    debe pedirla explícitamente."""
+    if not base_model_path:
+        return None
+    stem = Path(str(base_model_path)).stem
+    m = _YOLO_SIZE_RE.search(stem)
+    return m.group(1).lower() if m else None
+
+
+def export_model_onnx(pt_path):
+    """Exporta un .pt a ONNX con Ultralytics (ya trae esto integrado) y
+    devuelve el Path del .onnx generado (mismo directorio, mismo stem)."""
+    exported = YOLO(str(pt_path)).export(format="onnx")
+    onnx_path = Path(exported)
+    if not onnx_path.exists():
+        # Ultralytics normalmente devuelve la ruta correcta, pero por las
+        # dudas se verifica el nombre convencional junto al .pt de origen.
+        fallback = Path(pt_path).with_suffix(".onnx")
+        if fallback.exists():
+            return fallback
+        raise RuntimeError(f"La exportación a ONNX no generó el archivo esperado ({exported})")
+    return onnx_path
+
+
+def _normalize_yolo_rows(raw_rows):
+    """results.csv trae todo como strings y 'epoch' 0-indexado (mismo criterio
+    que usa training_artifact_summary/public_job internamente). Para el hub se
+    normaliza a numérico y a época 1-indexada, consistente con cómo se muestra
+    'época N' en el resto de esta UI."""
+    normalized = []
+    for row in raw_rows:
+        clean = {}
+        for key, raw_value in row.items():
+            value = metric_float(row, key)
+            clean[key] = value if value is not None else raw_value
+        if isinstance(clean.get("epoch"), (int, float)):
+            clean["epoch"] = int(clean["epoch"]) + 1
+        normalized.append(clean)
+    return normalized
+
+
+def publish_model_to_hub(model_name, description, tags, size_override=None, display_name=None):
+    """Publica un modelo entrenado (.pt + .onnx exportado al vuelo) al Model
+    Hub compartido (mismo repo/cifrado que usa ai-ocr-2026/ocr-labeling —
+    ver plan-model-hub.md). `tags` es una lista de strings libres ("¿qué
+    detecta?": precintos, patentes, etc — ver selector de tags en la UI).
+    `display_name` determina la identidad del modelo en el catálogo (mismo
+    nombre = misma entrada, nueva versión agregada — ver catalog.make_model_id
+    en el driver); por eso el dialog de subida ofrece autocompletar con los
+    nombres ya usados."""
+    if "/" in model_name or ".." in model_name or not model_name.endswith(".pt"):
+        raise ValueError("Nombre de modelo inválido")
+    pt_path = DATA_DIR / "models" / model_name
+    if not pt_path.exists():
+        raise ValueError(f"No se encontró el modelo {model_name}")
+
+    metadata = read_model_metadata(pt_path) or {}
+    train_config = metadata.get("train_config") or {}
+    size = (size_override or infer_yolo_size(train_config.get("model_path")) or "").lower()
+    if size not in ("n", "s", "m", "l", "x"):
+        raise ValueError(
+            "No se pudo determinar la talla (n/s/m/l/x) del modelo base "
+            f"({train_config.get('model_path') or 'desconocido'}). Especificala manualmente."
+        )
+
+    run_dir = metadata.get("run_dir")
+    rows = _normalize_yolo_rows(yolo_metrics(run_dir)["rows"]) if run_dir else []
+    summary = (metadata.get("metrics") or {}).get("summary") or {}
+    best_metric = summary.get("best_metric")
+    best_epoch = summary.get("best_epoch")
+
+    onnx_path = export_model_onnx(pt_path)
+
+    files = {"pt": pt_path, "onnx": onnx_path}
+    display_name = display_name or model_name
+
+    from model_hub import ModelHubPublisher
+    publisher = ModelHubPublisher()
+    result = publisher.publish(
+        family="yolo",
+        size=size,
+        display_name=display_name,
+        description=description,
+        files=files,
+        headline_metric={
+            "label": "mAP50-95",
+            "value": best_metric if isinstance(best_metric, (int, float)) else 0.0,
+            "format": "number",
+        },
+        chart_series=[
+            {"key": "metrics/mAP50-95(B)", "label": "mAP50-95"},
+            {"key": "metrics/mAP50(B)", "label": "mAP50"},
+            {"key": "metrics/precision(B)", "label": "precision"},
+            {"key": "metrics/recall(B)", "label": "recall"},
+            {"key": "train/box_loss", "label": "box_loss"},
+            {"key": "val/box_loss", "label": "val_box_loss"},
+        ],
+        rows=rows,
+        # +1 para que "best_epoch" quede en la misma numeración 1-indexada
+        # que se usa en `rows` (ver _normalize_yolo_rows) — el summary interno
+        # de este archivo lo guarda 0-indexado, crudo del CSV de Ultralytics.
+        extra_metrics=[{"label": "best_epoch", "value": str(int(best_epoch) + 1)}] if best_epoch is not None else [],
+        tags=[t for t in (tags or []) if t],
+    )
+    return result
+
+
 def train_async(job_id, project_id, config):
     state["training"] = True
     state["last_train_status"] = {"status": "running", "project": project_id}
@@ -938,6 +1054,29 @@ def api_models():
     return jsonify({"models": model_files(), "available_models": available_model_options(), "active_model_path": state["model_path"]})
 
 
+@app.post("/api/models/<name>/publish-to-hub")
+def api_publish_model_to_hub(name):
+    payload = request.get_json(force=True, silent=True) or {}
+    description = (payload.get("description") or "").strip()
+    tags_raw = payload.get("tags") or []
+    tags = [str(t).strip() for t in tags_raw if str(t).strip()] if isinstance(tags_raw, list) else []
+    size_override = (payload.get("size") or "").strip().lower() or None
+    display_name = (payload.get("display_name") or "").strip() or None
+    if not description:
+        return jsonify({"status": "error", "message": "description is required"}), 400
+    try:
+        result = publish_model_to_hub(
+            name, description, tags,
+            size_override=size_override, display_name=display_name,
+        )
+        return jsonify({"status": "ok", **result})
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception("Error publicando %s al Model Hub", name)
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
 @app.post("/api/external-models")
 def api_upload_external_model():
     upload = request.files.get("model")
@@ -1073,6 +1212,14 @@ def index():
         </div>
       </v-app-bar-title>
       <template v-slot:append>
+        <v-tooltip text="Abrir el Model Hub en una pestaña nueva" location="bottom">
+          <template v-slot:activator="{{ props }}">
+            <v-btn v-bind="props" class="mr-2" icon size="small" variant="text"
+                   href="https://oneclickeb.github.io/models-hub/" target="_blank" rel="noopener">
+              <v-icon size="20">mdi-cloud-outline</v-icon>
+            </v-btn>
+          </template>
+        </v-tooltip>
         <v-chip v-if="activeModelName" class="mr-2" prepend-icon="mdi-brain" size="small" color="primary" variant="tonal">
           {{{{ activeModelName }}}}
         </v-chip>
@@ -1744,7 +1891,8 @@ def index():
                     <tr>
                       <th class="text-caption">Nombre</th>
                       <th class="text-caption">Tamaño</th>
-                      <th class="text-caption">mAP50-95</th>
+                      <th class="text-caption">mAP50-95 (best)</th>
+                      <th class="text-caption">Época best</th>
                       <th class="text-caption">Proyecto</th>
                       <th class="text-caption">Fecha</th>
                       <th class="text-caption">Acciones</th>
@@ -1758,6 +1906,7 @@ def index():
                       </td>
                       <td class="text-caption">{{{{ m.sizeLabel }}}}</td>
                       <td class="text-caption">{{{{ m.map5095 }}}}</td>
+                      <td class="text-caption">{{{{ m.bestEpoch }}}}</td>
                       <td class="text-caption">{{{{ m.project }}}}</td>
                       <td class="text-caption">{{{{ m.modifiedLabel }}}}</td>
                       <td>
@@ -1783,6 +1932,17 @@ def index():
                             </v-btn>
                           </template>
                         </v-tooltip>
+                        <v-tooltip text="Subir al Model Hub" location="top">
+                          <template v-slot:activator="{{ props }}">
+                            <v-btn
+                              v-bind="props"
+                              icon size="x-small" variant="text" color="cyan-lighten-1"
+                              @click="openHubDialog(m)"
+                            >
+                              <v-icon size="16">mdi-cloud-upload-outline</v-icon>
+                            </v-btn>
+                          </template>
+                        </v-tooltip>
                       </td>
                     </tr>
                   </tbody>
@@ -1793,6 +1953,51 @@ def index():
           </v-tabs-window-item>
 
         </v-tabs-window>
+
+        <!-- Dialog: Subir al Model Hub -->
+        <v-dialog v-model="hubDialog.open" max-width="480" persistent>
+          <v-card>
+            <v-card-title class="text-body-2 font-weight-bold">Subir al Model Hub</v-card-title>
+            <v-card-text>
+              <v-combobox
+                v-model="hubDialog.displayName" :items="hubNameItems"
+                item-title="value" item-value="value"
+                label="Nombre (mismo nombre = misma entrada, se agrega como nueva versión)"
+                density="compact" variant="outlined" class="mb-2" hide-details="auto"
+              >
+                <template v-slot:item="{{ item, props }}">
+                  <v-list-item v-bind="props" :title="item.raw.value" :subtitle="item.raw.date"></v-list-item>
+                </template>
+              </v-combobox>
+              <v-textarea
+                v-model="hubDialog.description" label="Descripción" density="compact"
+                variant="outlined" rows="2" class="mb-2" hide-details="auto"
+              ></v-textarea>
+              <v-combobox
+                v-model="hubDialog.tags" :items="hubTagItems"
+                label="¿Qué detecta? (tags — Enter para agregar)"
+                density="compact" variant="outlined" class="mb-2" hide-details="auto"
+                multiple chips closable-chips
+              ></v-combobox>
+              <v-select
+                v-model="hubDialog.size" :items="['(auto)', 'n', 's', 'm', 'l', 'x']"
+                label="Talla" density="compact" variant="outlined" hide-details="auto"
+              ></v-select>
+              <div v-if="hubMsg" class="text-caption mt-2" :class="hubMsgOk ? 'text-success' : 'text-error'">
+                {{{{ hubMsg }}}}
+              </div>
+            </v-card-text>
+            <v-card-actions>
+              <v-spacer></v-spacer>
+              <v-btn variant="text" :disabled="publishingToHub" @click="closeHubDialog">Cancelar</v-btn>
+              <v-btn
+                color="cyan-lighten-1" variant="flat" :loading="publishingToHub"
+                :disabled="!hubDialog.displayName.trim() || !hubDialog.description.trim()"
+                @click="confirmPublishToHub"
+              >Subir</v-btn>
+            </v-card-actions>
+          </v-card>
+        </v-dialog>
       </v-container>
     </v-main>
 
@@ -1893,6 +2098,12 @@ createApp({{
     const uploadingModel = ref(false);
     const uploadMsg = ref('');
     const uploadOk = ref(true);
+    const hubDialog = ref({{ open: false, item: null, displayName: '', description: '', tags: [], size: '(auto)' }});
+    const publishingToHub = ref(false);
+    const hubMsg = ref('');
+    const hubMsgOk = ref(true);
+    const hubNameItems = ref([]);
+    const hubTagItems = ref([]);
     const startingTrain = ref(false);
     const startTrainMsg = ref('');
     const startTrainOk = ref(true);
@@ -1930,6 +2141,72 @@ createApp({{
       const {{ current_epoch, total_epochs }} = job.progress;
       if (!total_epochs) return 0;
       return Math.round((current_epoch / total_epochs) * 100);
+    }}
+
+    async function fetchHubCatalogForDialog() {{
+      // Catálogo público del hub (raw.githubusercontent, CORS abierto) —
+      // se consulta directo desde el navegador, sin pasar por el backend.
+      // Alimenta el autocompletar de "Nombre" (con fecha de la última subida,
+      // para republicar bajo la MISMA identidad) y las sugerencias de tags.
+      try {{
+        const res = await fetch('https://raw.githubusercontent.com/OneclickEB/models-hub/main/catalog.json', {{ cache: 'no-cache' }});
+        const data = await res.json();
+        const yoloModels = (data.models || []).filter(m => m.family === 'yolo');
+        hubNameItems.value = yoloModels.map(m => {{
+          const latest = (m.versions || [])[0];
+          const date = latest && latest.released_at ? new Date(latest.released_at).toLocaleString('es-AR') : '';
+          return {{ value: m.display_name, date }};
+        }});
+        const tagSet = new Set();
+        yoloModels.forEach(m => (m.tags || []).forEach(t => tagSet.add(t)));
+        hubTagItems.value = Array.from(tagSet).sort();
+      }} catch (e) {{
+        console.warn('Error fetching hub catalog', e);
+      }}
+    }}
+    function openHubDialog(m) {{
+      hubDialog.value = {{ open: true, item: m, displayName: m.name, description: '', tags: [], size: '(auto)' }};
+      hubMsg.value = '';
+      fetchHubCatalogForDialog();
+    }}
+    function closeHubDialog() {{
+      if (publishingToHub.value) return;
+      hubDialog.value = {{ open: false, item: null, displayName: '', description: '', tags: [], size: '(auto)' }};
+    }}
+    async function confirmPublishToHub() {{
+      const item = hubDialog.value.item;
+      const displayName = String(hubDialog.value.displayName).trim();
+      const description = hubDialog.value.description.trim();
+      if (!item || !displayName || !description) return;
+      publishingToHub.value = true;
+      hubMsg.value = '';
+      try {{
+        const size = hubDialog.value.size === '(auto)' ? '' : hubDialog.value.size;
+        const res = await fetch('/api/models/' + encodeURIComponent(item.name) + '/publish-to-hub', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            description, tags: hubDialog.value.tags,
+            size, display_name: displayName,
+          }}),
+        }});
+        const data = await res.json().catch(() => ({{}}));
+        if (res.ok) {{
+          let copied = false;
+          try {{ await navigator.clipboard.writeText(data.hub_url); copied = true; }} catch (e) {{}}
+          hubMsg.value = 'Subido — ' + data.model_id + ' (' + data.version + '). ' + data.hub_url + (copied ? ' (copiado)' : '');
+          hubMsgOk.value = true;
+          setTimeout(() => {{ if (hubMsgOk.value) closeHubDialog(); }}, 4000);
+        }} else {{
+          hubMsg.value = 'Error: ' + (data.message || JSON.stringify(data));
+          hubMsgOk.value = false;
+        }}
+      }} catch (e) {{
+        hubMsg.value = 'Error de red: ' + e.message;
+        hubMsgOk.value = false;
+      }} finally {{
+        publishingToHub.value = false;
+      }}
     }}
 
     async function uploadExternalModel() {{
@@ -2032,12 +2309,18 @@ createApp({{
           if (!trainForm.value.model_path) trainForm.value.model_path = active.path;
         }}
         modelsTable.value = (data.models || []).map(m => {{
-          const lat = (m.metadata && m.metadata.metrics && m.metadata.metrics.latest) || {{}};
+          // El mAP mostrado debe ser el BEST histórico (summary), no el de la
+          // última época (latest) — con early stopping o overfitting tardío
+          // la última época puede tener peor mAP que el checkpoint guardado
+          // como best.pt, y mostrar "latest" no coincidía con el "Best época
+          // X · mAP Y" que ya se muestra en la card del job de este mismo modelo.
+          const summary = (m.metadata && m.metadata.metrics && m.metadata.metrics.summary) || {{}};
           return {{
             ...m,
-            map5095: lat['metrics/mAP50-95(B)'] != null ? Number(lat['metrics/mAP50-95(B)']).toFixed(4) : '—',
+            map5095: summary.best_metric != null ? Number(summary.best_metric).toFixed(4) : '—',
+            bestEpoch: summary.best_epoch != null ? summary.best_epoch : '—',
             project: (m.metadata && m.metadata.dataset && m.metadata.dataset.project) || '—',
-            modifiedLabel: m.modified_at ? new Date(m.modified_at * 1000).toLocaleDateString('es-AR') : '—',
+            modifiedLabel: m.modified_at ? new Date(m.modified_at * 1000).toLocaleString('es-AR') : '—',
             sizeLabel: fmtSize(m.size),
           }};
         }});
@@ -2237,6 +2520,8 @@ createApp({{
       deleteJob, useForInference, patiencePct, patienceColor,
       metricLabels, chartsHtml,
       modelsTable, fmtSize,
+      hubDialog, publishingToHub, hubMsg, hubMsgOk, hubNameItems, hubTagItems,
+      openHubDialog, closeHubDialog, confirmPublishToHub,
     }};
   }},
 }}).use(vuetify).component('field-label', FieldLabel).mount('#app');

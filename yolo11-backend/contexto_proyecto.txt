@@ -253,3 +253,218 @@ UI/backend de entrenamiento actualizados para configurar lr0, weight_decay y cos
 
 /m2data/infra-label-studio/infra/yolo11-backend/contexto_proyecto.txt:
 Este archivo de contexto fue creado para futuros agentes.
+
+ACTUALIZACION 2026-07-15: INTEGRACION MODEL HUB (Fase 4 de plan-model-hub.md)
+Contexto: existe un "Model Hub" propio (repo publico OneclickEB/models-hub, sitio
+estatico en GitHub Pages) donde se publican modelos entrenados cifrados (AES-256-GCM)
+desde varios proyectos. El proyecto dueno del plan y del driver canonico es
+/m2data/proyectos/ai-ocr-2026 (ver ai-ocr-2026/tmp/planes/plan-model-hub.md para el
+diseno completo). yolo11-backend es el segundo consumidor/productor (el primero fue
+ai-ocr-2026/componentes/tools/ocr-labeling, LPR OCR Labeler).
+
+Que se agrego:
+- Paquete /m2data/infra-label-studio/infra/yolo11-backend/model_hub/ (copiado a mano
+  desde la fuente canonica ai-ocr-2026/componentes/tools/model-hub-driver/model_hub/
+  porque este proyecto no tiene git para hacer un COPY con submodulo/symlink). Si se
+  actualiza el driver canonico, hay que volver a copiar estos archivos a mano aca.
+- requirements.txt: agregado cryptography>=42.0 (cifrado) y onnxscript>=0.7.0
+  (necesario para exportar a ONNX con Ultralytics bajo torch 2.13 — sin este paquete
+  la exportacion falla con "No module named 'onnxscript'", mismo sintoma que se dio
+  y se resolvio en ai-ocr-2026/ocr-labeling).
+- Dockerfile: agregado COPY model_hub/ ./model_hub/.
+- docker-compose.yml (servicio yolo11-backend): agregadas env vars MODEL_HUB_KEY_FILE,
+  MODEL_HUB_GH_TOKEN, MODEL_HUB_REPO; agregado volumen ./yolo11-backend/model_hub:/app/model_hub:ro
+  (mismo patron que app.py: cambios en el driver aplican con solo recrear el
+  contenedor, sin rebuild de imagen, EXCEPTO si cambian las dependencias de
+  requirements.txt); agregado bind mount de la MISMA clave que usa ocr-labeling
+  (/m2data/proyectos/ai-ocr-2026/componentes/tools/ocr-labeling/secrets/model_hub_key.txt)
+  montada como /run/secrets/model_hub_key.txt — es una unica passphrase compartida
+  para todo el hub, no una clave separada por proyecto.
+- .env (de infra-label-studio/infra, gitignored): agregadas MODEL_HUB_GH_TOKEN y
+  MODEL_HUB_REPO (mismos valores que ai-ocr-2026/ocr-labeling/.env — mismo token
+  personal de GitHub reutilizado, mismo repo).
+- app.py: funciones nuevas infer_yolo_size() (deduce n/s/m/l/x del nombre del modelo
+  BASE usado para entrenar via regex sobre el sufijo, ej. 'yolo11n.pt' o
+  'precintos-s.pt'; NO hay un campo explicito de talla en este proyecto),
+  export_model_onnx() (usa YOLO(...).export(format="onnx"), ya integrado en
+  Ultralytics), _normalize_yolo_rows() (convierte los strings crudos de
+  results.csv a numerico y corrige 'epoch' a 1-indexado, porque el CSV de
+  Ultralytics es 0-indexado — ver metric_float ya existente), y
+  publish_model_to_hub() que arma todo y llama a ModelHubPublisher.publish().
+  Nuevo endpoint POST /api/models/<name>/publish-to-hub, body
+  {"description": str requerido, "target": str opcional (que detecta el modelo,
+  ej. "precintos"), "size": str opcional ("n"/"s"/"m"/"l"/"x", fuerza la talla
+  si infer_yolo_size no puede deducirla), "display_name": str opcional}.
+  UI: boton nuevo "Subir al Model Hub" (icono mdi-cloud-upload-outline) en cada
+  fila de la tabla "Modelos entrenados", abre un v-dialog (Nombre, Descripcion,
+  Que detecta, Talla con opcion "(auto)") y hace POST al endpoint nuevo. Estado
+  Vue nuevo: hubDialog, publishingToHub, hubMsg, hubMsgOk; funciones
+  openHubDialog/closeHubDialog/confirmPublishToHub. IMPORTANTE: app.py es un
+  UNICO f-string de Python — toda llave literal { } dentro del HTML/JS esta
+  escapada como {{ }}, y las llaves de Vue {{ x }} quedan como {{{{ x }}}} en el
+  código fuente. Revisar esto con cuidado en cualquier edicion futura de esta zona.
+
+Talla (n/s/m/l/x): la mayoria de los modelos ya entrenados en este servidor son
+fine-tunes encadenados de otros modelos ya entrenados (train_config.model_path
+apunta a otro project-XX-...-best.pt, no a un yolo11X.pt/precintos-X.pt), por lo
+que infer_yolo_size() casi siempre falla para ellos y hay que elegir la talla a
+mano en el dialog. Solo el modelo base original (precintos-s.pt) permite inferencia
+automatica. Esto es una limitacion conocida, no un bug — no hay forma de recuperar
+la talla real de un fine-tune encadenado sin que quede registrada en algun lado
+(se podria agregar a futuro un campo explicito en el job si se vuelve un problema).
+
+Prueba end-to-end realizada 2026-07-15: se publico project-19-eae223cd-best.pt
+(talla inferida automaticamente: 's', target 'precintos') via curl real contra el
+endpoint. Se verifico manualmente: aparicion en catalog.json del hub con headline
+mAP50-95=0.92971, 1827 filas de metricas (mAP50-95/mAP50/precision/recall/losses),
+best_epoch=1728; se descargaron ambos artifacts (.pt.enc y .onnx.enc) del Release
+de GitHub y se verifico por SHA-256 que el contenido desencriptado (con la misma
+clave compartida) es identico byte a byte al .pt y .onnx generados en el
+contenedor. Este modelo publicado quedo como entrada real en el catalogo publico
+(no fue una prueba descartable — es un modelo de precintos legitimo).
+
+Pendiente de plan-model-hub.md (no se hizo en esta fase): Fase 5 (vista final del
+sitio del hub con graficos para YOLO — ya se subieron rows con las keys crudas de
+Ultralytics 'metrics/mAP50-95(B)' etc, listas para que el renderer las consuma),
+Fase 6 (documentacion de integracion a neuralVISION), Fase 7 (cierre/version bump
+de ai-ocr-2026).
+
+ACTUALIZACION 2026-07-15 (2): FIX tabla "Modelos entrenados" — mAP inconsistente
+con la card del job. La tabla tomaba metadata.metrics.latest (metricas de la
+ULTIMA epoca corrida) para la columna mAP50-95, mientras que la card del job de
+ese mismo modelo (job_card_html, backend) muestra metadata.metrics.summary
+(el mejor historico, que es el que realmente corresponde al best.pt guardado).
+Con early stopping o degradacion tardia esos dos valores pueden diferir bastante
+(caso real detectado: card mostraba "Best ep.426 · mAP 0.7906" pero la tabla
+mostraba 0.7361 de la ultima epoca). Fix en fetchModels() (JS, dentro del
+<script> de app.py): ahora usa metadata.metrics.summary.best_metric/best_epoch
+en vez de metadata.metrics.latest. Se agrego ademas una columna "Epoca best" a
+la tabla (antes no se mostraba en absoluto) y se corrigio el formato de fecha de
+toLocaleDateString (solo fecha) a toLocaleString (fecha + hora), tambien pedido
+por el usuario. Verificado post-fix contra project-19-59b27aca-best.pt: la API
+ahora devuelve best_metric=0.79063 / best_epoch=426, coincidiendo con la card.
+
+ACTUALIZACION 2026-07-15 (3): FIX BUG CRITICO en el driver compartido model_hub —
+publicar con un target de texto libre con espacios/acentos (ej: "precintos y tapas
+de válvula", tal como lo escribio el usuario en el dialog "Subir al Model Hub")
+rompia la publicacion: GitHub Releases rechazaba el tag_name resultante con 422
+"tag_name is not a valid tag / is not well-formed". Causa raiz: model_hub/catalog.py
+-> make_model_id(family, size, task_or_target) concatenaba el target CRUDO (sin
+sanitizar) al model_id, que publisher.py usa tal cual como git tag del Release
+(f"{{model_id}}-{{version_id}}"). Fix aplicado en la fuente CANONICA del driver
+(ai-ocr-2026/componentes/tools/model-hub-driver/model_hub/catalog.py): nueva
+funcion _slug_part() que normaliza unicode (quita acentos), pasa a minusculas y
+colapsa cualquier caracter no alfanumerico a un solo "-"; se aplica a family,
+size y task_or_target dentro de make_model_id(). "precintos y tapas de válvula"
+-> "precintos-y-tapas-de-valvula". No afecta model_id ya existentes en el
+catalogo (lprocr/yolo/v2/n-s-m-l-x ya eran alfanumericos puros, la funcion es
+no-op para esos casos). IMPORTANTE: este proyecto tiene una copia MANUAL del
+driver en yolo11-backend/model_hub/ (no hay git ni symlink al canonico) — el fix
+se copio a mano (cp catalog.py) y se recreo el contenedor (alcanza con recrear,
+sin rebuild de imagen, porque model_hub esta montado como volumen ro). Si se
+vuelve a tocar el driver canonico en el futuro, recordar repetir esta copia
+manual acá. Tambien se reconstruyo/recreo ai-ocr-2026/ocr-labeling (el otro
+consumidor del mismo driver, ese si vía COPY en su Dockerfile) para que reciba
+el mismo fix. Verificado con make_model_id() dentro de ambos contenedores
+post-deploy: el target con espacios/acentos ahora produce un model_id valido.
+
+ACTUALIZACION 2026-07-15 (4): SEGUNDO bug critico + rediseño de identidad +
+tags. Al reintentar publicar (con target ya sanitizado por el fix anterior),
+la subida fallaba con "Expecting value: line 1 column 1 (char 0)". Causa
+raiz: catalog.json (compartido por TODOS los modelos ya publicados, LPR OCR
++ YOLO) habia crecido a 1.38MB porque cada version subida guardaba TODAS las
+filas de metricas por epoca inline (YOLO llego a 1827 filas en un solo
+modelo). La API de Contents de GitHub deja de devolver el campo 'content'
+inline para archivos >1MB (encoding pasa a "none") — publisher.py._get_catalog()
+hacia json.loads("") sobre eso -> JSONDecodeError. Ademas se detecto que el
+Release SI se creaba y los assets SI se subian antes de este paso, dejando
+releases huerfanos sin reflejarse en el catalogo (se identificaron y
+borraron 3: yolo-precintos-s-20260715-143922, -143817 y
+yolo-precinto-tapa-s-20260715-142839, via gh release delete --cleanup-tag).
+
+Fix aplicado en la fuente CANONICA del driver (ai-ocr-2026/componentes/tools/
+model-hub-driver/model_hub/):
+- publisher.py: las filas de metricas (rows) ya NO van inline en
+  catalog.json — se suben como asset propio ({slug}.rows.json, sin cifrar,
+  no es sensible) y catalog.json guarda solo rows_url + rows_count.
+  client.get_rows(version) resuelve esto (usa 'rows' inline si existe, para
+  compat con entradas viejas, o descarga rows_url). _get_catalog() ademas
+  ahora tiene fallback al Git Data API (blobs, soporta hasta 100MB) por si
+  el catalogo igual llegara a superar 1MB en el futuro.
+- catalog.py: make_model_id(family, size, task_or_target) ->
+  make_model_id(family, display_name). La identidad de un modelo en el
+  catalogo ahora se deriva del NOMBRE que el usuario elige al publicar, NO
+  de size/target/task. Esto ademas resuelve de raiz el problema de fondo del
+  usuario: "necesito que el nombre sea unico, si subo dos veces
+  precintos-s.pt solo deberia existir el ultimo" — con la identidad basada
+  en nombre, publicar 2 veces con el mismo nombre agrega una version nueva a
+  la MISMA entrada (versions[0] = mas reciente, ver catalog.add_version) en
+  vez de crear una entrada duplicada. upsert_model() ahora recibe tags
+  (lista de strings) en vez de target (string).
+- Se migraron in-place las 5 entradas ya publicadas (mismo model_id de cada
+  una, se les externalizaron las rows subiendo el asset a su release ya
+  existente) via un script one-off (no quedo en el repo, se corrio y
+  descarto). catalog.json paso de 1.38MB a ~15-20KB. Estas 5 entradas viejas
+  NO se migraron al esquema de identidad-por-nombre (quedan con su
+  model_id viejo tipo lprocr-v2-n / yolo-precintos-s); solo las
+  publicaciones NUEVAS usan el esquema nuevo. Ver plan-model-hub.md
+  (ai-ocr-2026/tmp/planes/) seccion "Nota (2026-07-15)" para el detalle
+  completo del esquema.
+
+Cambios en este proyecto (app.py):
+- publish_model_to_hub(model_name, description, tags, ...) — parametro
+  `target` (str) renombrado a `tags` (list[str]).
+- Endpoint POST /api/models/<name>/publish-to-hub ahora acepta body.tags
+  (array) en vez de body.target (string).
+- UI: el campo "¿Que detecta?" paso de v-text-field libre a v-combobox
+  multiple+chips (tags, con Enter para agregar, sugerencias de tags ya
+  usados). El campo "Nombre" paso de v-text-field a v-combobox con
+  autocompletar: sugiere nombres ya publicados + fecha/hora de su ultima
+  subida (formato "nombre (fecha hora)"), tomados directo del catalog.json
+  publico via fetch al raw.githubusercontent.com desde el navegador (sin
+  pasar por el backend — el catalogo es publico y tiene CORS abierto).
+  Nuevas funciones JS: fetchHubCatalogForDialog(), refs hubNameItems/
+  hubTagItems, llamadas al abrir el dialog (openHubDialog).
+
+Se aplico el MISMO cambio de tags + autocompletar de nombre en
+ai-ocr-2026/componentes/tools/ocr-labeling (LPR OCR Labeler) para
+consistencia entre ambos consumidores del hub — ver su propio historial de
+cambios en ese proyecto (trainer_service.py, trainer.py, TrainHistoryView.vue,
+TrainerView.vue).
+
+Tambien se actualizo models-hub/docs/app.js (repo separado, ya tenia un
+renderer de detalle con grafico mas avanzado de lo registrado como pendiente
+en la Fase 5 del plan) para leer tags/rows_url en vez de target/rows inline
+— sin este fix el sitio hubiera dejado de mostrar chips de "que detecta" y
+graficos de entrenamiento para publicaciones nuevas. Commiteado y pusheado
+directo a ese repo (GitHub Pages se actualiza solo).
+
+Verificacion post-fix: republicado project-19-59b27aca-best.pt como
+"precintos-s.pt" dos veces seguidas con tags ["precintos"] / ["precintos",
+"tapas de válvula"] — confirmado que ambas subidas quedaron bajo el MISMO
+model_id (yolo-precintos-s-pt) con 2 versiones (versions[0] = la mas
+reciente), catalog.json se mantuvo en ~20KB, y rows_url de cada version
+resuelve correctamente (1426 filas cada una).
+
+ACTUALIZACION 2026-07-15 (5): TERCER bug — el sitio del hub mostraba la
+tarjeta y las metricas del detalle bien, pero el grafico de entrenamiento
+quedaba en blanco (canvas negro/vacio, sin error visible). Causa raiz:
+rows_url apuntaba a un asset de GitHub Release
+(release-assets.githubusercontent.com via redirect) — esos NO tienen header
+access-control-allow-origin, asi que el fetch() del sitio (origen distinto,
+oneclickeb.github.io) lo bloquea el navegador por CORS, silenciosamente
+(el catch(() => {}) de app.js no mostraba nada, de ahi que pareciera "no
+pasa nada"). raw.githubusercontent.com si tiene CORS abierto (verificado:
+access-control-allow-origin: *).
+
+Fix en publisher.py (fuente canonica del driver): nuevo metodo
+_put_repo_file(path, content, message) que commitea un archivo chico
+DIRECTO AL REPO via Contents API (no como asset de Release) y devuelve su
+URL raw.githubusercontent.com. Las rows de metricas ahora se commitean en
+metrics/{model_id}/{version_id}.json en vez de subirse como asset — son
+livianas (KBs, no MBs como los .pt/.onnx, que siguen yendo a Release por
+tamaño). Se migraron las 9 versiones ya publicadas (bajando su contenido
+del Release viejo y re-commiteandolo al repo, actualizando rows_url en
+catalog.json). Verificado con una publicacion nueva: rows_url ya sale
+apuntando a raw.githubusercontent.com desde el primer intento, con CORS
+abierto confirmado y las 1426 filas legibles via fetch().

@@ -18,6 +18,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
 COPY app.py .
+COPY model_hub/ ./model_hub/
 
 EXPOSE 9090
 CMD ["gunicorn", "--bind", "0.0.0.0:9090", "--timeout", "600", "app:app"]

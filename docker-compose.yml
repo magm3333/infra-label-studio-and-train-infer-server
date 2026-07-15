@@ -35,11 +35,19 @@ services:
       - TRAIN_PATIENCE=20
       - TRAIN_WORKERS=2
       - TRAIN_DEVICE=auto
+      - MODEL_HUB_KEY_FILE=/run/secrets/model_hub_key.txt
+      - MODEL_HUB_GH_TOKEN=${MODEL_HUB_GH_TOKEN:-}
+      - MODEL_HUB_REPO=${MODEL_HUB_REPO:-OneclickEB/models-hub}
     volumes:
       - ./yolo11-backend/app.py:/app/app.py:ro
+      - ./yolo11-backend/model_hub:/app/model_hub:ro
+      - ./yolo11-backend/VERSION:/app/VERSION:ro
       - ./mydata:/label-studio/data:rw
       - ./mydata/yolo-backend:/app/data:rw
       - /m2data/proyectos/neural-vision/infra/nv-client1/models:/models:rw
+      # Misma clave que usa ai-ocr-2026/ocr-labeling — un único Model Hub,
+      # una única passphrase para todo lo publicado (ver plan-model-hub.md).
+      - /m2data/proyectos/ai-ocr-2026/componentes/tools/ocr-labeling/secrets/model_hub_key.txt:/run/secrets/model_hub_key.txt:ro
     ports:
       - 9090:9090
     depends_on:
