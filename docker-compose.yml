@@ -38,10 +38,15 @@ services:
       - MODEL_HUB_KEY_FILE=/run/secrets/model_hub_key.txt
       - MODEL_HUB_GH_TOKEN=${MODEL_HUB_GH_TOKEN:-}
       - MODEL_HUB_REPO=${MODEL_HUB_REPO:-OneclickEB/models-hub}
+      - YOLO_TRAINER_JWT_SECRET=${YOLO_TRAINER_JWT_SECRET:-}
     volumes:
-      - ./yolo11-backend/app.py:/app/app.py:ro
-      - ./yolo11-backend/model_hub:/app/model_hub:ro
-      - ./yolo11-backend/VERSION:/app/VERSION:ro
+      # Codigo fuente mudado a /m2data/proyectos/yolo-trainer (ver contexto_proyecto.txt);
+      # este compose y mydata/ se quedan en infra-label-studio, Label Studio no se mueve.
+      - /m2data/proyectos/yolo-trainer/app.py:/app/app.py:ro
+      - /m2data/proyectos/yolo-trainer/auth.py:/app/auth.py:ro
+      - /m2data/proyectos/yolo-trainer/telegram_notifier.py:/app/telegram_notifier.py:ro
+      - /m2data/proyectos/yolo-trainer/model_hub:/app/model_hub:ro
+      - /m2data/proyectos/yolo-trainer/VERSION:/app/VERSION:ro
       - ./mydata:/label-studio/data:rw
       - ./mydata/yolo-backend:/app/data:rw
       - /m2data/proyectos/neural-vision/infra/nv-client1/models:/models:rw
