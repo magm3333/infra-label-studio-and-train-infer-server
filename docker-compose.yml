@@ -1,7 +1,7 @@
 services:
   label-studio:
     image: heartexlabs/label-studio:1.23.0
-    restart: always
+    restart: "no"
     container_name: label-studio
     user: "1000"
     environment:
@@ -18,12 +18,10 @@ services:
     command: ["gunicorn", "--bind", "0.0.0.0:9090", "--timeout", "600", "--access-logfile", "-", "app:app"]
     gpus: all
     shm_size: 4gb
-    restart: always
+    restart: "no"
     container_name: yolo11-backend
     environment:
       - TZ=America/Argentina/Buenos_Aires
-      - MODEL_PATH=/models/precintos-s.pt
-      - TRAIN_MODEL_PATH=/models/precintos-s.pt
       - LABEL_STUDIO_URL=http://label-studio:8080
       - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY:-}
       - LABEL_STUDIO_AUTH_SCHEME=Bearer
@@ -45,11 +43,13 @@ services:
       - /m2data/proyectos/yolo-trainer/app.py:/app/app.py:ro
       - /m2data/proyectos/yolo-trainer/auth.py:/app/auth.py:ro
       - /m2data/proyectos/yolo-trainer/telegram_notifier.py:/app/telegram_notifier.py:ro
+      - /m2data/proyectos/yolo-trainer/projects_store.py:/app/projects_store.py:ro
+      - /m2data/proyectos/yolo-trainer/lifecycle_slides.py:/app/lifecycle_slides.py:ro
+      - /m2data/proyectos/yolo-trainer/train_worker.py:/app/train_worker.py:ro
       - /m2data/proyectos/yolo-trainer/model_hub:/app/model_hub:ro
       - /m2data/proyectos/yolo-trainer/VERSION:/app/VERSION:ro
       - ./mydata:/label-studio/data:rw
       - ./mydata/yolo-backend:/app/data:rw
-      - /m2data/proyectos/neural-vision/infra/nv-client1/models:/models:rw
       # Misma clave que usa ai-ocr-2026/ocr-labeling — un único Model Hub,
       # una única passphrase para todo lo publicado (ver plan-model-hub.md).
       - /m2data/proyectos/ai-ocr-2026/componentes/tools/ocr-labeling/secrets/model_hub_key.txt:/run/secrets/model_hub_key.txt:ro
